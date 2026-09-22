@@ -917,6 +917,9 @@ try {
   check('prepareRequestImages projects positive integer width', Number.isSafeInteger(targetReceived?.width) && targetReceived.width > 0, String(targetReceived?.width))
   check('prepareRequestImages projects positive integer height', Number.isSafeInteger(targetReceived?.height) && targetReceived.height > 0, String(targetReceived?.height))
   check('prepareRequestImages includes positive integer maxBytes', Number.isSafeInteger(targetReceived?.maxBytes) && targetReceived.maxBytes > 0, String(targetReceived?.maxBytes))
+  // Harness >= 0.1.6 ignores maxPixels, but harness < 0.1.6 validates it and
+  // rejects a target that omits it, so it has to ride along in the same target.
+  check('prepareRequestImages keeps maxPixels for harness < 0.1.6', Number.isSafeInteger(targetReceived?.maxPixels) && targetReceived.maxPixels > 0, String(targetReceived?.maxPixels))
 
   const toolMessages = [
     { role: 'user', content: [{ type: 'text', text: 'run' }] },
