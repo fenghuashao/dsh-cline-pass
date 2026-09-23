@@ -97,6 +97,12 @@ cline_pass_pin      model=cline-pass/glm-5.2 upstreams=["alibaba","baseten"] pin
 | `cline_pass_accounts` | 管理账号 |
 | `cline_pass_history` | 查看请求历史 |
 
+## 请求历史
+
+面板里的 **最近请求** 读的是进程内的调用日志：只记录走 `cline-pass` 路由的调用，保存在内存中，重启 dsh 后从零开始，最多保留 `historyLimit`（默认 100）条。标题右侧会显示已记录的条数，展开即读取最新 25 条；每行依次是模型、**账号**、上游和耗时，账号就是这一轮轮询选中的那个。
+
+**订阅模型** 列表较长，标题栏的 **收起 / 展开** 可以折叠整份列表，收起后标题仍显示模型数量。
+
 ## 开发
 
 ```bash

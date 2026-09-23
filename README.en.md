@@ -97,6 +97,12 @@ cline_pass_pin      model=cline-pass/glm-5.2 upstreams=["alibaba","baseten"] pin
 | `cline_pass_accounts` | Manage accounts |
 | `cline_pass_history` | Read request history |
 
+## Request history
+
+**Recent requests** in the panel reads the in-process call log: only calls that went through the `cline-pass` route are recorded, the log lives in memory (it starts empty after a dsh restart), and it keeps at most `historyLimit` rows (100 by default). The summary shows how many rows are recorded; opening it reads the newest 25, one row per call: model, **account**, upstream, latency. The account is whichever the round-robin picked for that call.
+
+The **Models** list is long, so the card's **Collapse / Expand** control folds it away; the title still reports how many models the route serves.
+
 ## Development
 
 ```bash

@@ -70,34 +70,54 @@ function renderNode(node, depth = 0) {
 /**
  * Run one function component for real.
  *
- * Hooks are stubbed with a per-call cursor: `useState` returns the initial
- * value and a no-op setter, and `useEffect` is skipped (its callback is
- * captured so a test can assert it does not throw on its own). This is enough
- * to execute every branch a first render takes.
+ * Components reach React through `require('react')`, never through props, so
+ * the seed table hands out ONE shared stand-in and it keeps its hook slots
+ * across renders — that is what lets a test drive a single interaction (opening
+ * the history fold) and re-render to see what the panel did with the answer.
+ * `useEffect` is captured but never run: the reads it would trigger need a live
+ * host, and nothing here asserts anything about them.
  */
-function runComponent(component, props) {
-  const effects = []
-  let cursor = 0
-  const slots = []
-  const React = {
-    createElement,
-    Fragment: Symbol('Fragment'),
-    useState(initial) {
-      const index = cursor++
-      if (!(index in slots)) slots[index] = typeof initial === 'function' ? initial() : initial
-      return [slots[index], (next) => { slots[index] = typeof next === 'function' ? next(slots[index]) : next }]
-    },
-    useEffect(callback) { effects.push(callback) },
-    useMemo(factory) { cursor += 1; return factory() },
-    useRef(initial) { cursor += 1; return { current: initial } },
-    useCallback(callback) { cursor += 1; return callback },
-  }
-  const tree = renderNode(component({ ...props, React }))
-  return { tree, effects }
+const CLIENT_REACT = {
+  createElement,
+  Fragment: Symbol('Fragment'),
+  useState(initial) {
+    const index = CLIENT_REACT.__cursor++
+    if (!(index in CLIENT_REACT.__slots)) CLIENT_REACT.__slots[index] = typeof initial === 'function' ? initial() : initial
+    return [CLIENT_REACT.__slots[index], (next) => { CLIENT_REACT.__slots[index] = typeof next === 'function' ? next(CLIENT_REACT.__slots[index]) : next }]
+  },
+  useEffect(callback) { CLIENT_REACT.__effects.push(callback) },
+  useMemo(factory) { CLIENT_REACT.__cursor += 1; return factory() },
+  useRef(initial) { CLIENT_REACT.__cursor += 1; return { current: initial } },
+  useCallback(callback) { CLIENT_REACT.__cursor += 1; return callback },
+  __slots: [],
+  __effects: [],
+  __cursor: 0,
 }
 
-// ── a window/require harness shaped like the browser module system ──────────
+/** Render one component with the hook cursor reset, as React would. */
+function runComponent(component, props) {
+  CLIENT_REACT.__cursor = 0
+  CLIENT_REACT.__effects = []
+  const tree = renderNode(component({ ...props, React: CLIENT_REACT }))
+  return { tree, effects: CLIENT_REACT.__effects }
+}
 
+/** Find the first rendered host element a predicate accepts. */
+function findNode(node, predicate) {
+  if (node === null || node === undefined || typeof node !== 'object') return null
+  if (Array.isArray(node)) {
+    for (const child of node) {
+      const hit = findNode(child, predicate)
+      if (hit !== null) return hit
+    }
+    return null
+  }
+  if (node.fragment !== undefined) return findNode(node.fragment, predicate)
+  if (node.tag !== undefined) return predicate(node) ? node : findNode(node.children ?? [], predicate)
+  return findNode(node.children ?? [], predicate)
+}
+
+/** A window/require harness shaped like the browser module system. */
 const registered = []
 
 /** The platform seed words the shell actually provides (see dsh-client-modules). */
@@ -119,16 +139,8 @@ const windowStub = {
 let missingRequires = []
 
 function makeRequire() {
-  const React = {
-    createElement,
-    Fragment: Symbol('Fragment'),
-    useState: (initial) => [typeof initial === 'function' ? initial() : initial, () => {}],
-    useEffect: () => {},
-    useMemo: (factory) => factory(),
-    useRef: () => ({ current: undefined }),
-  }
   return (specifier) => {
-    if (specifier === 'react') return React
+    if (specifier === 'react') return CLIENT_REACT
     missingRequires.push(specifier)
     throw new Error(`client-modules: require("${specifier}") missed the module table`)
   }
@@ -247,6 +259,24 @@ function collectText(node) {
   return own.flatMap(collectText)
 }
 
+/**
+ * Collect the text of a RENDERED tree (what `renderNode` returned).
+ *
+ * {@link collectText} walks the raw element tree, where a function component's
+ * own children are whatever was passed to it — usually nothing — so its output
+ * is invisible. Anything asserted about a component's body has to read the
+ * rendered children instead.
+ */
+function collectRenderedText(node) {
+  if (node === null || node === undefined || typeof node === 'boolean') return []
+  if (typeof node === 'string' || typeof node === 'number') return [String(node)]
+  if (Array.isArray(node)) return node.flatMap(collectRenderedText)
+  if (node.fragment !== undefined) return collectRenderedText(node.fragment)
+  if (node.text !== undefined) return [String(node.text)]
+  const props = node.props ?? {}
+  return [node.children ?? [], props.title, props.placeholder, props['aria-label']].flat(Infinity).flatMap(collectRenderedText)
+}
+
 /** A locale stand-in whose namespace lookup echoes keys, as an unregistered one does. */
 function echoingLocale(active) {
   return {
@@ -349,6 +379,105 @@ check('the browser half no longer speaks the old RPC channel', !source.includes(
 // A caller on the Models page gets the same controller as the Settings page,
 // so the two can never disagree about what is configured.
 check('one controller serves every registration', new Set(registrations.map((registration) => registration.options.inject)).size <= registrations.length)
+
+// ── the history fold reads on open, and says so ─────────────────────────────
+// The rows live on the host, so nothing but an explicit read can ever put them
+// on screen. Reporting the empty state before that read is what made a
+// hundred-row history look permanently blank.
+
+const panelCalls = []
+const previousFetch = globalThis.fetch
+globalThis.fetch = async (url, init) => {
+  const body = JSON.parse(String(init?.body ?? '{}'))
+  panelCalls.push({ url: String(url), endpoint: String(body.endpoint), payload: body.payload })
+  const value = body.endpoint === 'history'
+    ? { total: 2, entries: [{ ts: 1, model: 'cline-pass/glm-5.2', provider: 'alibaba', account: 'backup-2', ms: 42, stream: true, error: '' }] }
+    : {}
+  return { ok: true, status: 200, json: async () => ({ ok: true, value }) }
+}
+
+/** One model row as the panel projects it, with nothing pinned yet. */
+const modelRow = (id) => ({
+  id, displayName: id.replace(/^cline-pass\//, ''), pipeline: '', pinnable: true,
+  pinMode: 'strict', sort: '', pinned: [], excluded: [], upstreams: [], upstreamStatus: [],
+  lastProvider: '', lastMs: 0, probedAt: 0, validatedAt: 0,
+})
+
+try {
+  const section = registrations.find((registration) => registration.options.name === 'settings.section')
+  const props = propsFor(section)
+  const store = props.hooks.clinePass
+  store.set({
+    ...store.getSnapshot(),
+    status: 'ready',
+    data: {
+      provider: 'cline-pass', displayName: 'Cline Pass', baseURL: 'https://api.cline.bot/api/v1',
+      settingsAvailable: true, accountMode: 'single', activeAccount: '', ready: true,
+      accounts: [{ key: 'default', displayName: 'Cline Pass', apiKeyEnv: 'CLINE_PASS_API_KEY', enabled: true, keyConfigured: true, keyHint: 'sk_liv…3456' }],
+      models: [modelRow('cline-pass/glm-5.2'), modelRow('cline-pass/kimi-k3')],
+      pinnedModels: 0, catalogCount: 0, historySize: 2,
+    },
+  })
+
+  const before = runComponent(section.component, props)
+  const beforeText = collectRenderedText(before.tree).join(' ')
+  check('a closed history fold still reports how much was recorded', beforeText.includes('2 条'), beforeText.slice(0, 200))
+  check('an unread history says it is unread instead of empty', beforeText.includes('处理中…') && !beforeText.includes('暂无记录。'), beforeText.slice(-200))
+
+  const details = findNode(before.tree, (node) => node.tag === 'details')
+  check('the history fold is a details element with a toggle handler', typeof details?.props?.onToggle === 'function')
+
+  // Mounting the panel is the first read: the rows have to be there whether or
+  // not the fold is ever opened.
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0))
+  for (const effect of before.effects) effect()
+  await tick()
+  check('mounting the panel reads the history once', panelCalls.filter((entry) => entry.endpoint === 'history').length === 1, JSON.stringify(panelCalls))
+
+  const afterMount = runComponent(section.component, props)
+  const mountedText = collectRenderedText(afterMount.tree).join(' ')
+  check('the rows the host returned are rendered into the fold', mountedText.includes('cline-pass/glm-5.2') && mountedText.includes('alibaba') && mountedText.includes('42ms'), mountedText.slice(-260))
+  check('each row names the account that served it', mountedText.includes('backup-2'), mountedText.slice(-260))
+
+  if (typeof details?.props?.onToggle !== 'function') {
+    failures.push('the history fold cannot be reopened: no toggle handler to drive')
+  } else {
+    details.props.onToggle({ currentTarget: { open: true } })
+    await tick()
+    check('reopening the fold reads again', panelCalls.filter((entry) => entry.endpoint === 'history').length === 2, JSON.stringify(panelCalls))
+
+    details.props.onToggle({ currentTarget: { open: false } })
+    await tick()
+    check('closing the fold asks for nothing', panelCalls.filter((entry) => entry.endpoint === 'history').length === 2, JSON.stringify(panelCalls))
+  }
+
+  // ── the model list folds away ─────────────────────────────────────────────
+  const listText = collectRenderedText(afterMount.tree).join(' ')
+  check('the model list starts expanded', listText.includes('cline-pass/kimi-k3'), listText.slice(0, 200))
+
+  const fold = findNode(afterMount.tree, (node) => node.tag === 'button' && node.props['aria-expanded'] !== undefined)
+  check('the model list carries a fold control', fold !== undefined && fold.props['aria-expanded'] === true, JSON.stringify(fold?.props?.['aria-expanded']))
+
+  if (fold === undefined) {
+    failures.push('the model list cannot be folded: no control to drive')
+  } else {
+    fold.props.onClick()
+    const folded = runComponent(section.component, props)
+    const foldedText = collectRenderedText(folded.tree).join(' ')
+    // The history rows name models too, so the fold is proven by the one model
+    // only the list carries and by the per-row action that disappears with it.
+    check('folding the list hides every model row', !foldedText.includes('cline-pass/kimi-k3') && !foldedText.includes('一键配置'), foldedText.slice(0, 240))
+    check('the folded list still says how many models the route serves', foldedText.includes('2 个模型'), foldedText.slice(0, 240))
+    const reopen = findNode(folded.tree, (node) => node.tag === 'button' && node.props['aria-expanded'] !== undefined)
+    check('the fold control flips to reopening', reopen?.props?.['aria-expanded'] === false, JSON.stringify(reopen?.props?.['aria-expanded']))
+    reopen.props.onClick()
+    const expanded = runComponent(section.component, props)
+    check('reopening the list brings the rows back', collectRenderedText(expanded.tree).join(' ').includes('cline-pass/kimi-k3'))
+  }
+} finally {
+  if (previousFetch === undefined) delete globalThis.fetch
+  else globalThis.fetch = previousFetch
+}
 
 if (failures.length > 0) {
   console.error(`\n✘ ${failures.length} check(s) failed, ${passed} passed:\n`)
