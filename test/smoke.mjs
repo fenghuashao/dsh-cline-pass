@@ -449,13 +449,44 @@ try {
     exposeCatalog: false,
     historyLimit: 20,
   }
+  /**
+   * The real settings service MERGES plain objects recursively (see
+   * `dsh-settings`'s `mergeLayers`). A fake that assigned the patch wholesale
+   * would hide exactly the defect this file exists to catch: a merge can add or
+   * change a nested key but can never remove one, so a deleted account survives
+   * in the layer underneath and returns on the next read.
+   */
+  const mergePatch = (under, over) => {
+    if (typeof under !== 'object' || under === null || Array.isArray(under)) return over
+    if (typeof over !== 'object' || over === null || Array.isArray(over)) return over
+    const merged = { ...under }
+    for (const [key, value] of Object.entries(over)) merged[key] = key in merged ? mergePatch(merged[key], value) : value
+    return merged
+  }
+  /** Drop one path from a section without touching the original object. */
+  const withoutPath = (value, path) => {
+    const [head, ...rest] = path.map(String)
+    if (rest.length === 0) {
+      const copy = { ...value }
+      delete copy[head]
+      return copy
+    }
+    return { ...value, [head]: withoutPath(value?.[head] ?? {}, rest) }
+  }
   const settingsService = {
     installSection(_owner, _ns, _schema, entry, hooks) {
       hooks.setSource(() => section)
       void entry
     },
     async update(_ns, patch) {
-      section = { ...section, ...patch }
+      section = mergePatch(section, patch)
+    },
+    /** The only write mode that can express a deletion. */
+    async mutate(_ns, ops) {
+      for (const op of ops) {
+        if (op?.op !== 'unset') throw new Error(`this fake settings service only implements unset, not ${String(op?.op)}`)
+        section = withoutPath(section, op.path)
+      }
     },
   }
   const fakeCtx = {
@@ -507,7 +538,8 @@ try {
     settingsAvailable: () => true,
     routeRegistered: () => true,
     readConfig: () => section,
-    updateConfig: async (patch) => { section = { ...section, ...patch } },
+    updateConfig: async (patch) => { section = mergePatch(section, patch) },
+    removeAccount: async (name) => { section = withoutPath(section, ['accounts', String(name)]) },
     accounts: () => accountProfilesOf(section),
     accountsWithKeys: async () => await Promise.all(accountProfilesOf(section).map(async (account) => {
       const value = credentials.get(String(account.apiKeyEnv))
@@ -600,6 +632,14 @@ try {
     removeMissing = String(error.message)
   }
   check('removing an unknown account fails loudly', /no account named/.test(removeMissing), removeMissing)
+
+  // A merge-only write is enough to ADD an account and never enough to drop
+  // one, so `set` must unset whatever the new pool leaves out.
+  await call('cline_pass_accounts', { action: 'add', name: 'third', key: 'sk_third_account_0001' })
+  const shrunk = await call('cline_pass_accounts', { action: 'set', accounts: [{ name: 'backup', apiKeyEnv: 'CLINE_PASS_BACKUP_KEY' }] })
+  check('set shrinks the pool instead of merging into it', shrunk.accounts.length === 1 && shrunk.accounts[0].key === 'backup' && section.accounts.third === undefined, JSON.stringify(Object.keys(section.accounts)))
+  const emptied = await call('cline_pass_accounts', { action: 'set', accounts: [] })
+  check('an empty set removes every explicit account', Object.keys(section.accounts).length === 0 && emptied.accounts.length === 1 && emptied.accounts[0].key === 'default', JSON.stringify(Object.keys(section.accounts)))
 
   const history = await call('cline_pass_history', { limit: 5 })
   check('history records the probe, validate and test calls', history.total > 0, String(history.total))
@@ -842,6 +882,7 @@ try {
   const panelHistory = await panel.history({ limit: 3 })
   check('history returns the most recent rows only', panelHistory.entries.length <= 3 && panelHistory.total > 0, JSON.stringify(panelHistory.total))
   check('history rows carry the model and latency', panelHistory.entries.every((entry) => entry.model !== '' && Number.isSafeInteger(entry.ms)))
+  check('history rows carry the account that served the call', panelHistory.entries.some((entry) => entry.account === 'default') && panelHistory.entries.every((entry) => typeof entry.account === 'string'), JSON.stringify(panelHistory.entries.map((entry) => entry.account)))
 
   let panelRejected = ''
   try {

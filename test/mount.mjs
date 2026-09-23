@@ -19,7 +19,7 @@
  */
 
 import { createServer } from 'node:http'
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { boot, loadOptionalPatches } from '@deepseek-ai/dsh-app-boot'
@@ -273,6 +273,33 @@ try {
 
   const pinResponse = await panelPost(envelope('model.pin', { model: 'cline-pass/kimi-k3', upstreams: ['gmicloud'], pinMode: 'preferred', sort: 'ttft' }), cookie)
   check('a panel write reaches the settings document', pinResponse.status === 200 && JSON.stringify(settings.get('cline-pass')?.perModel?.['cline-pass/kimi-k3']?.upstreams) === JSON.stringify(['gmicloud']), JSON.stringify(settings.get('cline-pass')?.perModel))
+
+  // ── the account pool can shrink ───────────────────────────────────────────
+  // The settings document is resolved by MERGING plain objects recursively, so
+  // a merge-only write can add an account but never drop one. Removing an
+  // account therefore has to go through a path-addressed unset; when it did not,
+  // the panel's Remove button reported success and the account came straight
+  // back on the next read (and in the document on disk).
+  const settingsFile = () => readFileSync(join(scratch, 'settings.yaml'), 'utf8')
+  const addedAccount = await panelPost(envelope('account.add', { name: 'second', displayName: 'second', key: 'sk_mount_second_key' }), cookie)
+  check('the panel adds an account to the pool', addedAccount.json?.ok === true && (addedAccount.json?.value?.accounts ?? []).length === 2, JSON.stringify(addedAccount.json?.value?.accounts))
+
+  const removeResponse = await panelPost(envelope('account.remove', { name: 'second' }), cookie)
+  const afterRemove = Object.keys(settings.get('cline-pass')?.accounts ?? {})
+  check('removing an account drops it from the settings section', afterRemove.includes('second') === false, afterRemove.join(','))
+  check('removing an account is reflected in the state the panel renders', !(removeResponse.json?.value?.accounts ?? []).some((account) => account.key === 'second'), JSON.stringify(removeResponse.json?.value?.accounts))
+  check('removing an account rewrites the document on disk', /second/.test(settingsFile()) === false, settingsFile())
+  const removeUnknown = await panelPost(envelope('account.remove', { name: 'ghost' }), cookie)
+  check('removing an unknown account is refused', removeUnknown.json?.ok === false, JSON.stringify(removeUnknown.json))
+
+  // ── the history the panel reads ───────────────────────────────────────────
+  // Recording happens in the adapter; this is the read the browser half makes.
+  const historyResponse = await panelPost(envelope('history', { limit: 5 }), cookie)
+  check('the panel history reports the calls this process served', (historyResponse.json?.value?.entries ?? []).length >= 2, JSON.stringify(historyResponse.json?.value))
+  check('the history rows name the model and the serving upstream', (historyResponse.json?.value?.entries ?? []).every((entry) => entry.model === 'cline-pass/glm-5.2' && entry.provider !== ''), JSON.stringify(historyResponse.json?.value?.entries?.[0]))
+  check('the history rows name the account the call was routed through', (historyResponse.json?.value?.entries ?? []).every((entry) => entry.account === 'default'), JSON.stringify(historyResponse.json?.value?.entries?.map((entry) => entry.account)))
+  const stateAfterHistory = await panelPost(envelope('state'), cookie)
+  check('the panel snapshot carries the same recorded count the fold reads', (stateAfterHistory.json?.value?.historySize ?? 0) === historyResponse.json?.value?.total && (historyResponse.json?.value?.total ?? 0) > 0, JSON.stringify({ state: stateAfterHistory.json?.value?.historySize, history: historyResponse.json?.value?.total }))
 
   const unknownResponse = await panelPost(envelope('nope'), cookie)
   check('an unknown action is a typed failure over the wire', unknownResponse.status === 200 && unknownResponse.json?.ok === false, `HTTP ${unknownResponse.status} — ${unknownResponse.text.slice(0, 120)}`)
