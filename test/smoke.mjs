@@ -17,7 +17,7 @@
 import { createServer } from 'node:http'
 import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
 import { ClinePassAdapter, Config, DEFAULT_REQUEST_IMAGE_POLICY, apply, inject, name } from '../lib/index.js'
-import { buildRequestBody, reasoningOf } from '../lib/adapter.js'
+import { buildRequestBody, prepareRequestImages, projectImageDimensions, reasoningOf, requestImageTarget } from '../lib/adapter.js'
 import { createEngine } from '../lib/engine.js'
 import { createPanel, PANEL_ERROR_CODE, PANEL_PATH, registerPanel } from '../lib/panel.js'
 import {
@@ -32,6 +32,7 @@ import {
 } from '../lib/protocol.js'
 import { createStore } from '../lib/store.js'
 import { MODEL_CATALOG, REASONING_EFFORTS, resolveModelMetadata } from '../lib/catalog.js'
+import { fetchOfficialModels } from '../lib/cline.js'
 
 // ── stub gateway ────────────────────────────────────────────────────────────
 
@@ -47,6 +48,10 @@ const stub = {
   requests: [],
   /** which content the next successful stream carries */
   stream: 'tool-call',
+  /** when true the gateway drops the pin and serves `servedBy` instead */
+  ignorePins: false,
+  /** the channel a pin-ignoring gateway routes to */
+  servedBy: 'deepseek',
 }
 
 /** The pin a request carries, read back per pipeline. */
@@ -135,7 +140,9 @@ const gateway = createServer(async (request, response) => {
     response.writeHead(400, { 'Content-Type': 'application/json' })
     return response.end(JSON.stringify(routingError(entry.upstreams)))
   }
-  const upstream = effectiveUpstream(pin, entry.upstreams[0])
+  const upstream = stub.ignorePins === true
+    ? (stub.servedBy ?? 'deepseek')
+    : effectiveUpstream(pin, entry.upstreams[0])
   if (stub.broken.includes(upstream)) {
     response.writeHead(400, { 'Content-Type': 'application/json' })
     return response.end(JSON.stringify({ error: `invalid_request_error: upstream ${upstream} refused the pin` }))
@@ -175,6 +182,23 @@ function check(label, condition, detail = '') {
 }
 
 const same = (left, right) => JSON.stringify(left) === JSON.stringify(right)
+
+/**
+ * Layer `over` onto `under` the way `dsh-settings` does.
+ *
+ * Plain objects merge recursively and everything else replaces wholesale, so a
+ * patch that omits a key leaves the stored value in place. Mirrored here so the
+ * stub below cannot accept a delete the real service would refuse.
+ */
+function mergeInto(under, over) {
+  const plain = (value) => typeof value === 'object' && value !== null && !Array.isArray(value)
+  if (!plain(under) || !plain(over)) return over
+  const merged = { ...under }
+  for (const [key, value] of Object.entries(over)) {
+    merged[key] = Object.hasOwn(merged, key) ? mergeInto(merged[key], value) : value
+  }
+  return merged
+}
 
 /** Redact a secret the way the plugin reports one (mirrors `lib/index.js`). */
 function maskKey(value) {
@@ -242,6 +266,27 @@ try {
 
   check('plugin identity', name === 'cline-pass' && same(inject, ['llm', 'tools']))
   check('config schema compiles', typeof Config === 'object' || typeof Config === 'function')
+  // From dsh 0.1.6 the settings service refuses EVERY write to an entry whose
+  // schema declares no volatile field (`volatileForm` returns undefined), which
+  // makes the panel's saves fail while its reads still work — exactly the
+  // "buttons do nothing" failure. The whole section is live: every consumer
+  // reads through the plugin's `current()` source thunk.
+  // Marking the writable fields is what the shipped packages do (ui-theme,
+  // agent-default-model, bash-local, llm-pi-ai): a whole-object `.volatile()`
+  // instead collapses the schema to `{}`, dropping every default with it.
+  // This mirrors `volatileForm()` in dsh-settings, which walks the schema and
+  // returns undefined when no field is live.
+  const hasLiveField = (schema) => {
+    if (schema?.meta?.volatile === true) return true
+    if (schema?.type !== 'object') return false
+    return Object.values(schema.dict ?? {}).some(hasLiveField)
+  }
+  // Only the newer line has the concept at all: schemastery 3.18.2 (0.1.5) has
+  // no `.volatile()`, and its settings service accepts writes without the
+  // declaration. Where the line does support it, at least one field must be
+  // marked or every save is rejected with "has no volatile fields".
+  const lineSupportsVolatile = typeof Config.volatile === 'function' || Config.meta?.volatile !== undefined
+  check('the config writes into live fields where the line requires it', !lineSupportsVolatile || hasLiveField(Config) === true, `${JSON.stringify(Config.meta)} volatile=${String(Config.meta?.volatile)}`)
 
   const plannerPin = injectPrefs({ model: 'm' }, { pipeline: 'planner', upstreams: ['alibaba', 'baseten'] }, { upstream: 'alibaba', strict: true, sort: 'cost' })
   check('strict pin on the planner pipeline uses providerOptions.gateway.only', same(plannerPin.providerOptions, { gateway: { only: ['alibaba'], sort: 'cost' } }), JSON.stringify(plannerPin))
@@ -340,6 +385,25 @@ try {
   check('finish reports the tool-call reason', same(chunks.at(-1), { type: 'finish', reason: { kind: 'tool-calls' } }), JSON.stringify(chunks.at(-1)))
   check('the finish chunk is last', types.at(-1) === 'finish')
   check('history recorded the serving upstream', plain.records.length === 1 && plain.records[0].provider === 'alibaba', JSON.stringify(plain.records))
+  // First-chunk time is what a user waits before anything appears, and it is
+  // measured from the request's start so it can be read next to `ms`.
+  check('the successful call records when its first chunk arrived', Number.isSafeInteger(plain.records[0].ttft) && plain.records[0].ttft > 0, JSON.stringify(plain.records[0].ttft))
+  check('the first chunk never arrives after the request ends', plain.records[0].ttft <= plain.records[0].ms, `${plain.records[0].ttft} vs ${plain.records[0].ms}`)
+  // The first byte is the gateway starting to talk at all; the pair is what tells
+  // "the socket is warm while the model thinks" from "the gateway said nothing".
+  check('the successful call records when its first byte arrived', Number.isSafeInteger(plain.records[0].ttfb) && plain.records[0].ttfb > 0, JSON.stringify(plain.records[0].ttfb))
+  check('the first byte never follows the first chunk', plain.records[0].ttfb <= plain.records[0].ttft, `${plain.records[0].ttfb} vs ${plain.records[0].ttft}`)
+  // Token counts come from the usage frame, which the gateway sends last, so
+  // capturing it means reading the chunk on its way to the caller. The reasoning
+  // count is what explains a long first-chunk wait: it is thinking the caller
+  // cannot see, because this gateway does not stream it.
+  check('the successful call records its token usage', plain.records[0].usage?.inputTokens === 8 && plain.records[0].usage?.outputTokens === 5, JSON.stringify(plain.records[0].usage))
+  // The cache count is present in this frame; the reasoning count is optional —
+  // `mapUsage` only carries it when the gateway reported it, so absent is a legal
+  // state and must not be read as zero reasoning.
+  check('the recorded usage carries the cache count', plain.records[0].usage?.cacheReadTokens === 2, JSON.stringify(plain.records[0].usage))
+  check('the reasoning count is either reported or absent', plain.records[0].usage?.reasoningTokens === undefined || Number.isSafeInteger(plain.records[0].usage.reasoningTokens), JSON.stringify(plain.records[0].usage))
+  check('the call records the reasoning effort it ran at', typeof plain.records[0].effort === 'string', JSON.stringify(plain.records[0].effort))
   check('the request carried the pinned model and stream flag', stub.requests.at(-1).model === 'cline-pass/glm-5.2' && stub.requests.at(-1).stream === true)
   check('the system prompt and tool schema reached the wire', stub.requests.at(-1).messages[0].role === 'system' && stub.requests.at(-1).tools[0].function.name === 'echo')
 
@@ -427,6 +491,10 @@ try {
   }
   check('every candidate failing raises one clear error', /refused the pin/.test(exhaustedError), exhaustedError)
   check('the failed call is recorded with its whole trace', exhausted.records.length === 1 && same(exhausted.records[0].attempts, ['baseten', 'alibaba']), JSON.stringify(exhausted.records))
+  // Zero is the fact "nothing ever arrived", not a missing measurement: the
+  // panel renders it as a dash rather than as an instant answer.
+  check('a call that streamed nothing records a zero first-chunk time', exhausted.records[0].ttft === 0, JSON.stringify(exhausted.records[0].ttft))
+  check('a call that never got a byte records a zero first-byte time', exhausted.records[0].ttfb === 0, JSON.stringify(exhausted.records[0].ttfb))
   stub.broken = []
 
   // ── tools through the plugin ──────────────────────────────────────────────
@@ -449,44 +517,38 @@ try {
     exposeCatalog: false,
     historyLimit: 20,
   }
-  /**
-   * The real settings service MERGES plain objects recursively (see
-   * `dsh-settings`'s `mergeLayers`). A fake that assigned the patch wholesale
-   * would hide exactly the defect this file exists to catch: a merge can add or
-   * change a nested key but can never remove one, so a deleted account survives
-   * in the layer underneath and returns on the next read.
-   */
-  const mergePatch = (under, over) => {
-    if (typeof under !== 'object' || under === null || Array.isArray(under)) return over
-    if (typeof over !== 'object' || over === null || Array.isArray(over)) return over
-    const merged = { ...under }
-    for (const [key, value] of Object.entries(over)) merged[key] = key in merged ? mergePatch(merged[key], value) : value
-    return merged
-  }
-  /** Drop one path from a section without touching the original object. */
-  const withoutPath = (value, path) => {
-    const [head, ...rest] = path.map(String)
-    if (rest.length === 0) {
-      const copy = { ...value }
-      delete copy[head]
-      return copy
-    }
-    return { ...value, [head]: withoutPath(value?.[head] ?? {}, rest) }
-  }
   const settingsService = {
     installSection(_owner, _ns, _schema, entry, hooks) {
       hooks.setSource(() => section)
       void entry
     },
+    // The real service merges a patch recursively, and only an explicit `unset`
+    // removes a key. A stub that replaced keys wholesale made every delete look
+    // like it worked, which is how a no-op `account.remove` shipped.
     async update(_ns, patch) {
-      section = mergePatch(section, patch)
+      section = mergeInto(section, patch)
     },
-    /** The only write mode that can express a deletion. */
     async mutate(_ns, ops) {
+      let next = section
       for (const op of ops) {
-        if (op?.op !== 'unset') throw new Error(`this fake settings service only implements unset, not ${String(op?.op)}`)
-        section = withoutPath(section, op.path)
+        if (op.op !== 'unset' || !Array.isArray(op.path) || op.path.length === 0) continue
+        const [head, ...rest] = op.path
+        if (rest.length === 0) {
+          next = { ...next }
+          delete next[head]
+          continue
+        }
+        const walk = (node, path) => {
+          const [key, ...tail] = path
+          if (node === null || typeof node !== 'object' || !(key in node)) return node
+          const copy = { ...node }
+          if (tail.length === 0) delete copy[key]
+          else copy[key] = walk(node[key], tail)
+          return copy
+        }
+        next = { ...next, [head]: walk(next[head], rest) }
       }
+      section = next
     },
   }
   const fakeCtx = {
@@ -538,8 +600,7 @@ try {
     settingsAvailable: () => true,
     routeRegistered: () => true,
     readConfig: () => section,
-    updateConfig: async (patch) => { section = mergePatch(section, patch) },
-    removeAccount: async (name) => { section = withoutPath(section, ['accounts', String(name)]) },
+    updateConfig: async (patch) => { section = { ...section, ...patch } },
     accounts: () => accountProfilesOf(section),
     accountsWithKeys: async () => await Promise.all(accountProfilesOf(section).map(async (account) => {
       const value = credentials.get(String(account.apiKeyEnv))
@@ -606,14 +667,70 @@ try {
   const tested = await call('cline_pass_test', { model: 'cline-pass/glm-5.2', upstreams: ['alibaba'] })
   check('test reports the serving upstream', tested.ok === true && tested.actual === 'alibaba', JSON.stringify(tested))
   check('test reports a single attempt', tested.trace.length === 1, JSON.stringify(tested.trace))
+  check("test surfaces the router's own account of the decision", /won tier 0/.test(tested.plan), tested.plan)
 
   const pinned = await call('cline_pass_pin', { model: 'cline-pass/glm-5.2', upstreams: ['baseten', 'alibaba'], pinMode: 'preferred', sort: 'cost' })
   check('pin persists into the settings section', same(section.perModel['cline-pass/glm-5.2'], { upstreams: ['baseten', 'alibaba'], exclude: [], pinMode: 'preferred', sort: 'cost' }), JSON.stringify(section.perModel))
   check('pin reports what it stored', pinned.pinned.join() === 'baseten,alibaba' && pinned.sort === 'cost', JSON.stringify(pinned))
   const repinned = await call('cline_pass_pin', { model: 'cline-pass/glm-5.2', exclude: ['baseten'] })
   check('pin keeps fields it was not given', repinned.pinned.join() === 'baseten,alibaba' && repinned.excluded.join() === 'baseten', JSON.stringify(repinned))
+
+  // ── a gateway that drops the pin ──────────────────────────────────────────
+  // The live behavior this fork exists to expose: the router ignores an `only`
+  // it cannot use and answers from a channel nobody asked for, with a clean 200.
+  // Every check below fails against the unfixed code, which read that 200 as
+  // success and recorded the pinned channel as verified-available — a verdict
+  // that then fed the exclusion allow-list and hid the leak it described.
+
+  stub.ignorePins = true
+
+  const ignored = await call('cline_pass_test', { model: 'cline-pass/glm-5.2', upstreams: ['alibaba'] })
+  check('an ignored pin fails the test instead of reporting success', ignored.ok === false, JSON.stringify(ignored))
+  check('the ignored pin names the channel that actually served it', ignored.actual === 'deepseek' && ignored.adopted === false, JSON.stringify(ignored))
+  check('the ignored pin says so in the error', /ignored the pin/.test(ignored.error), ignored.error)
+
+  const violated = await call('cline_pass_test', { model: 'cline-pass/glm-5.2', upstreams: ['alibaba'], exclude: ['deepseek'] })
+  check('an excluded channel serving the request is reported as a violation', violated.ok === false && /excluded channel/.test(violated.error), violated.error)
+
+  const ignoredValidate = await call('cline_pass_validate', { model: 'cline-pass/glm-5.2' })
+  check('no channel is called available while the pin is ignored', ignoredValidate.summary.ok === 0 && ignoredValidate.summary.bad === 2, JSON.stringify(ignoredValidate.summary))
+  check('every channel carries the not-adopted verdict', ignoredValidate.results.every((row) => row.status === 'not-adopted'), JSON.stringify(ignoredValidate.results))
+
+  const ignoredStore = createStore({ historyLimit: 5 })
+  ignoredStore.learn('cline-pass/glm-5.2', { pipeline: 'planner', upstreams: ['alibaba', 'baseten'], pinnable: true })
+  const ignoredRun = adapterFor({ store: ignoredStore, pin: () => ({ upstreams: ['alibaba'], pinMode: 'strict', sort: '', exclude: [] }) })
+  stub.stream = 'tool-call'
+  await collect(ignoredRun.adapter, {
+    provider: 'cline-pass',
+    model: 'cline-pass/glm-5.2',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+    signal: new AbortController().signal,
+  })
+  check('a stream served elsewhere does not mark the pinned channel available', !ignoredRun.learned.some((entry) => entry.status === 'ok'), JSON.stringify(ignoredRun.learned))
+  check('the stream records which channel really served it', ignoredRun.records[0]?.adherence === 'not-adopted' && ignoredRun.records[0]?.provider === 'deepseek', JSON.stringify(ignoredRun.records[0]))
+
+  // The channel that answered is a real channel even when the router's own pool
+  // omits it. That omission is how a model's official upstream stays invisible —
+  // and it is why an exclusion built from the pool could never cover it.
+  const ignoredProbe = await call('cline_pass_probe', { model: 'cline-pass/glm-5.2' })
+  check('a probe learns the channel that actually served it', ignoredProbe.upstreams.includes('deepseek'), JSON.stringify(ignoredProbe.upstreams))
+  check('the serving channel leads the list, out of reach of any bound', ignoredProbe.upstreams[0] === 'deepseek', JSON.stringify(ignoredProbe.upstreams))
+  check('the router pool survives alongside it', ignoredProbe.upstreams.includes('alibaba') && ignoredProbe.upstreams.includes('baseten'), JSON.stringify(ignoredProbe.upstreams))
+
+  stub.ignorePins = false
+
+  const restoredProbe = await call('cline_pass_probe', { model: 'cline-pass/glm-5.2' })
+  check('an ordinary probe goes back to the router pool alone', same(restoredProbe.upstreams, ['alibaba', 'baseten']), JSON.stringify(restoredProbe.upstreams))
+
   const cleared = await call('cline_pass_pin', { model: 'cline-pass/glm-5.2', upstreams: [], exclude: [], sort: 'none' })
   check('pin can clear back to automatic', cleared.pinned.length === 0 && cleared.excluded.length === 0 && cleared.sort === '')
+
+  // With no pin there is nothing to confirm, so the render must not imply a pin
+  // failed to take effect.
+  const autoTool = tools.get('cline_pass_test')
+  const autoValue = await autoTool.execute({ model: 'cline-pass/glm-5.2' }, { signal: new AbortController().signal })
+  const autoText = autoTool.output.render({}, autoValue).map((block) => block.text).join('\n')
+  check('automatic routing does not claim a pin could not be confirmed', autoValue.targets.length === 0 && !/could not be confirmed/.test(autoText), autoText)
 
   const added = await call('cline_pass_accounts', { action: 'add', name: 'backup', key: 'sk_backup_account_9876' })
   check('add registers the account', added.accounts.length === 2 && added.accounts.some((account) => account.key === 'backup'), JSON.stringify(added.accounts))
@@ -633,17 +750,14 @@ try {
   }
   check('removing an unknown account fails loudly', /no account named/.test(removeMissing), removeMissing)
 
-  // A merge-only write is enough to ADD an account and never enough to drop
-  // one, so `set` must unset whatever the new pool leaves out.
-  await call('cline_pass_accounts', { action: 'add', name: 'third', key: 'sk_third_account_0001' })
-  const shrunk = await call('cline_pass_accounts', { action: 'set', accounts: [{ name: 'backup', apiKeyEnv: 'CLINE_PASS_BACKUP_KEY' }] })
-  check('set shrinks the pool instead of merging into it', shrunk.accounts.length === 1 && shrunk.accounts[0].key === 'backup' && section.accounts.third === undefined, JSON.stringify(Object.keys(section.accounts)))
-  const emptied = await call('cline_pass_accounts', { action: 'set', accounts: [] })
-  check('an empty set removes every explicit account', Object.keys(section.accounts).length === 0 && emptied.accounts.length === 1 && emptied.accounts[0].key === 'default', JSON.stringify(Object.keys(section.accounts)))
-
   const history = await call('cline_pass_history', { limit: 5 })
   check('history records the probe, validate and test calls', history.total > 0, String(history.total))
   check('history rows carry the model and latency', history.entries.every((entry) => entry.model !== '' && Number.isSafeInteger(entry.ms)))
+  // The tool hands the same latency pair the panel shows, and the render
+  // spells it as `first/total`.
+  check('history rows carry the first-chunk time', history.entries.every((entry) => Number.isSafeInteger(entry.ttft) && entry.ttft >= 0), JSON.stringify(history.entries.map((entry) => entry.ttft)))
+  const historyText = tools.get('cline_pass_history').output.render({ limit: 5 }, history).map((block) => block.text).join('\n')
+  check('the history render spells out first-chunk over total', /\d+ms\/\d+ms|—\/\d+ms/.test(historyText), historyText.slice(0, 200))
 
   // ── image input ───────────────────────────────────────────────────────────
   // The harness hands adapters durable attachment REFERENCES, never bytes, so
@@ -651,11 +765,13 @@ try {
   // OpenAI content-part form. A model that advertises image input gets the
   // blocks; the harness projects them to text for one that does not.
   const PNG_BYTES = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4])
-  const IMAGE_REF = { attachmentId: 'att-image-1', bytes: PNG_BYTES.length, mediaType: 'image/png' }
+  // Every durable image reference carries its own intrinsic size; the request
+  // target is derived from it, so the fixture must carry it too.
+  const IMAGE_REF = { attachmentId: 'att-image-1', bytes: PNG_BYTES.length, mediaType: 'image/png', width: 2, height: 2 }
   const attachmentStore = {
     reads: [],
-    async readImageRequest(ref, policy) {
-      this.reads.push({ ref, policy })
+    async readImageRequest(ref, target) {
+      this.reads.push({ ref, target })
       return { variantId: 'v1', attachment: ref, data: PNG_BYTES, mediaType: 'image/png', bytes: PNG_BYTES.length, width: 2, height: 2, depth: 'uchar', space: 'srgb', hasAlpha: false }
     },
   }
@@ -684,7 +800,14 @@ try {
   check('the image becomes an inline image_url data URI', userParts?.[1]?.type === 'image_url' && userParts[1].image_url.url.startsWith('data:image/png;base64,'), JSON.stringify(userParts?.[1]).slice(0, 80))
   check('the base64 payload is the resolved request bytes', userParts?.[1]?.image_url.url === `data:image/png;base64,${Buffer.from(PNG_BYTES).toString('base64')}`, String(userParts?.[1]?.image_url.url))
   check('the attachment service was asked for one request version', attachmentStore.reads.length === 1 && attachmentStore.reads[0].ref.attachmentId === 'att-image-1', JSON.stringify(attachmentStore.reads.length))
-  check('the request version was read at the documented image budget', attachmentStore.reads[0]?.policy?.maxBytes === DEFAULT_REQUEST_IMAGE_POLICY.maxBytes && attachmentStore.reads[0]?.policy?.maxPixels === DEFAULT_REQUEST_IMAGE_POLICY.maxPixels, JSON.stringify(attachmentStore.reads[0]?.policy))
+  check('the request version was read with target dimensions and maxBytes', Number.isSafeInteger(attachmentStore.reads[0]?.target?.width) && attachmentStore.reads[0]?.target?.width > 0 && Number.isSafeInteger(attachmentStore.reads[0]?.target?.height) && attachmentStore.reads[0]?.target?.height > 0 && attachmentStore.reads[0]?.target?.maxBytes === DEFAULT_REQUEST_IMAGE_POLICY.maxBytes, JSON.stringify(attachmentStore.reads[0]?.target))
+  // The two host lines validate opposite shapes, so the target must carry both
+  // or every image fails on one of them: 0.1.2-0.1.5 check `maxPixels`/`maxBytes`,
+  // 0.1.6+ check `width`/`height`/`maxBytes` and reject a missing `width`.
+  const imageTarget = attachmentStore.reads[0]?.target
+  check('the request target satisfies the 0.1.2-0.1.5 contract', Number.isSafeInteger(imageTarget?.maxPixels) && imageTarget?.maxPixels > 0, JSON.stringify(imageTarget))
+  check('the request target satisfies the 0.1.6+ contract', Number.isSafeInteger(imageTarget?.width) && imageTarget?.width > 0 && Number.isSafeInteger(imageTarget?.height) && imageTarget?.height > 0, JSON.stringify(imageTarget))
+  check('the projected dimensions respect the pixel budget', imageTarget.width * imageTarget.height <= imageTarget.maxPixels, `${imageTarget.width}x${imageTarget.height} > ${imageTarget.maxPixels}`)
 
   // A text-only call must never touch the attachment service.
   attachmentStore.reads.length = 0
@@ -722,6 +845,25 @@ try {
     unresolvedError = String(error?.message ?? error)
   }
   check('an unresolved image reference is an explicit failure', /could not resolve|cannot read properties/i.test(unresolvedError), unresolvedError)
+
+  // ── request-image geometry ──────────────────────────────────────────────────
+  // The projection must be the harness's own geometry, because the older host
+  // applies exactly this and the newer one takes the value as given: if the two
+  // disagreed, the same image would render at different sizes per host.
+  const small = projectImageDimensions(800, 600, 4194304)
+  check('an image inside the budget is not resized', small.width === 800 && small.height === 600, JSON.stringify(small))
+  const huge = projectImageDimensions(6000, 4000, 4194304)
+  check('an oversized image is projected inside the budget', huge.width * huge.height <= 4194304 && huge.width > 0 && huge.height > 0, JSON.stringify(huge))
+  check('the projection preserves the aspect ratio', Math.abs((huge.width / huge.height) - 1.5) < 0.01, JSON.stringify(huge))
+  const tall = projectImageDimensions(1000, 10000, 1000000)
+  check('a tall image is projected inside the budget too', tall.width * tall.height <= 1000000 && tall.width > 0 && tall.height > 0, JSON.stringify(tall))
+  // A reference without usable dimensions cannot be turned into a target, and
+  // must fail loudly rather than sending `undefined` as a width.
+  let noSizeError = ''
+  try {
+    requestImageTarget({ attachmentId: 'att-x', mediaType: 'image/png', bytes: 4 }, DEFAULT_REQUEST_IMAGE_POLICY)
+  } catch (error) { noSizeError = String(error?.code ?? error?.message ?? error) }
+  check('a reference without dimensions is refused', /UNSUPPORTED_CONTENT/.test(noSizeError), noSizeError)
 
   check('assistant image output is refused, not dropped', (() => {
     try {
@@ -793,6 +935,67 @@ try {
   check('the effort list matches the gateway vocabulary exactly', REASONING_EFFORTS.map((effort) => effort.id).join(',') === 'none,minimal,low,medium,high,xhigh,max', REASONING_EFFORTS.map((effort) => effort.id).join(','))
   check('an explicit per-model effort override hides the picker', resolveModelMetadata('cline-pass', 'cline-pass/deepseek-v4.1-flash', { reasoning: false }, fallback).reasoning === undefined)
 
+  // ── a model newer than this release ────────────────────────────────────────
+  //
+  // The shipped table only knows the models that existed when this release was
+  // cut. A model published afterwards used to be adopted by id alone, so it
+  // resolved to the `text` fallback: selectable and chat-capable, but declared
+  // text-only, which makes the harness refuse its images with no explanation.
+  // The official scan now carries the modalities and caps each source publishes.
+  {
+    const newer = 'cline-pass/mimo-v2.6-pro'
+    check('a model absent from the shipped table is not in it', MODEL_CATALOG[newer] === undefined)
+    const unknown = resolveModelMetadata('cline-pass', newer, emptyOverride, fallback)
+    check('without published metadata a new model falls back to text', unknown.inputModalities.join('+') === 'text', JSON.stringify(unknown.inputModalities))
+    check('without published metadata a new model falls back to the route window', unknown.context.contextWindow === fallback.contextWindow, String(unknown.context.contextWindow))
+
+    // What models.dev publishes for it, in the shape the scan now keeps.
+    const published = { name: 'MiMo-V2.6-Pro', inputModalities: ['text', 'image', 'audio', 'video'], contextWindow: 1048576, maxTokens: 131072 }
+    const resolved = resolveModelMetadata('cline-pass', newer, emptyOverride, fallback, published)
+    check('published modalities reach a new model', resolved.inputModalities.join('+') === 'text+image', JSON.stringify(resolved.inputModalities))
+    check('published modalities are clamped to the seam vocabulary', resolved.inputModalities.every((m) => m === 'text' || m === 'image'), JSON.stringify(resolved.inputModalities))
+    check('the published context window reaches a new model', resolved.context.contextWindow === published.contextWindow, String(resolved.context.contextWindow))
+    check('the published output cap reaches a new model', resolved.defaultMaxTokens === published.maxTokens, String(resolved.defaultMaxTokens))
+    check('the published display name reaches a new model', resolved.name === published.name, resolved.name)
+
+    // The shipped table is curated, so it stays the reference for what it knows:
+    // models.dev lists audio/video/pdf the seam would reject, and a display name
+    // the provider itself does not use.
+    const curated = resolveModelMetadata('cline-pass', 'cline-pass/mimo-v2.5', emptyOverride, fallback, { inputModalities: ['text', 'image', 'audio', 'video'], name: 'Wrong' })
+    check('the shipped table wins over the published scan', curated.inputModalities.join('+') === 'text+image', JSON.stringify(curated.inputModalities))
+    check('the shipped display name wins over the published scan', curated.name === MODEL_CATALOG['cline-pass/mimo-v2.5'].name, curated.name)
+    // And an explicit override still beats both.
+    const overridden = resolveModelMetadata('cline-pass', newer, { ...emptyOverride, input: ['text'] }, fallback, published)
+    check('a configured override still wins over the published scan', overridden.inputModalities.join('+') === 'text', JSON.stringify(overridden.inputModalities))
+  }
+
+  // The scan is what supplies that metadata, so it has to keep it. It used to
+  // read the ids and drop everything else, which is how a model published after
+  // this release arrived with no modalities at all.
+  {
+    const modelsDev = {
+      'cline-pass': { models: {
+        'mimo-v2.6-pro': { name: 'MiMo-V2.6-Pro', modalities: { input: ['text', 'image', 'audio', 'video'], output: ['text'] }, limit: { context: 1048576, output: 131072 } },
+      } },
+    }
+    const scan = await fetchOfficialModels({
+      fetchImpl: async (url) => ({
+        ok: true,
+        async json() { return String(url).includes('models.dev') ? modelsDev : { clinePass: ['cline-pass/mimo-v2.6-pro', 'cline-pass/brand-new'] } },
+      }),
+    })
+    const entry = scan.catalog?.['cline-pass/mimo-v2.6-pro'] ?? {}
+    check('the scan keeps the published modalities', JSON.stringify(entry.inputModalities) === JSON.stringify(['text', 'image', 'audio', 'video']), JSON.stringify(entry.inputModalities))
+    check('the scan keeps the published context window', entry.contextWindow === 1048576, String(entry.contextWindow))
+    check('the scan keeps the published output cap', entry.maxTokens === 131072, String(entry.maxTokens))
+    check('the scan keeps the published display name', entry.name === 'MiMo-V2.6-Pro', String(entry.name))
+    // A model only the id-list source knows still counts as known, with no
+    // invented metadata: the resolver's own fallback is the one interpretation.
+    check('an id-only source still contributes membership', scan.models.includes('cline-pass/brand-new'), scan.models.join(','))
+    check('an id-only model carries no invented metadata', scan.catalog['cline-pass/brand-new'] === undefined, JSON.stringify(scan.catalog['cline-pass/brand-new']))
+    check('the scan still reports its sources', scan.sources.join(',') === 'cline.api,models.dev', scan.sources.join(','))
+  }
+
   // ── reasoning effort reaches the wire ─────────────────────────────────────
   stub.requests.length = 0
   await collect(plain.adapter, {
@@ -823,6 +1026,18 @@ try {
   // live config the tool checks above just exercised.
   const panel = createPanel({ control: panelControl, engine: panelEngine, store })
 
+  // A fresh install has no `accounts` entry at all: the single account is the
+  // top-level key and its `apiKeyEnv`. There is nothing to delete, so the panel
+  // must say so rather than offering a button that cannot work.
+  {
+    const saved = section.accounts
+    section = { ...section, accounts: {} }
+    const fresh = createPanel({ control: panelControl, engine: panelEngine, store })
+    const freshState = await fresh.state({})
+    check('an implicit account is reported as undeclared', freshState.accounts.length === 1 && freshState.accounts[0].declared === false, JSON.stringify(freshState.accounts.map((account) => [account.key, account.declared])))
+    section = { ...section, accounts: saved }
+  }
+
   const panelState = await panel.state({})
   check('panel state exposes the route and the masked account', panelState.provider === 'cline-pass' && panelState.accounts[0].keyHint === 'sk_liv…3456', JSON.stringify(panelState.accounts))
   check('panel state reports readiness from the stored key', panelState.ready === true)
@@ -838,8 +1053,13 @@ try {
   await panel['key.set']({ ref: panelPrimary, value: 'sk_replaced_key_000000' })
   check('key.set stores the literal in the credential store', credentials.get(panelPrimary) === 'sk_replaced_key_000000', String(credentials.get(panelPrimary)))
 
+  // `declared` is what the delete button is gated on, and it has to be true for
+  // every account the pool materialized: gating on the pool size instead left
+  // the button dead for the common single-account case.
+  check('a materialized account reports itself as removable', panelState.accounts.length === 1 && panelState.accounts[0].declared === true, JSON.stringify(panelState.accounts.map((account) => [account.key, account.declared])))
   const panelAdded = await panel['account.add']({ name: 'panel', key: 'sk_panel_account_1111' })
   check('account.add registers the account and stores its key', panelAdded.accounts.some((account) => account.key === 'panel') && credentials.get('CLINE_PASS_PANEL_KEY') === 'sk_panel_account_1111')
+  check('every account written into the pool is removable', panelAdded.accounts.every((account) => account.declared === true), JSON.stringify(panelAdded.accounts.map((account) => [account.key, account.declared])))
   const panelMode = await panel['account.mode']({ mode: 'roundrobin' })
   check('account.mode switches the pool', panelMode.accountMode === 'roundrobin' && section.accountMode === 'roundrobin')
   const panelRemoved = await panel['account.remove']({ name: 'panel' })
@@ -858,22 +1078,6 @@ try {
   const panelTest = await panel['model.test']({ model: 'cline-pass/glm-5.2', upstreams: ['alibaba'] })
   check('model.test reports what actually served the call', panelTest.ok === true && panelTest.actual === 'alibaba', JSON.stringify(panelTest))
 
-  // A dead channel is never auto-pinned: with one channel refusing, the healthy
-  // one is pinned alone; with every channel refusing, the probe itself reports
-  // the failure and nothing is pinned at all.
-  stub.broken = ['baseten']
-  const auto = await panel['setup.auto']({ model: 'cline-pass/glm-5.2' })
-  check('setup.auto pins only the channels that answered', auto.ok === true && same(auto.pinned, ['alibaba']), JSON.stringify(auto))
-  check('setup.auto excludes the channel that refused', same(auto.excluded, ['baseten']), JSON.stringify(auto.excluded))
-  check('setup.auto verified the pin with a real call', auto.verified === true && auto.actual === 'alibaba', JSON.stringify(auto))
-  check('setup.auto persisted a preferred pin', section.perModel['cline-pass/glm-5.2'].pinMode === 'preferred', JSON.stringify(section.perModel['cline-pass/glm-5.2']))
-  stub.broken = ['alibaba', 'baseten']
-  const autoFailed = await panel['setup.auto']({ model: 'cline-pass/glm-5.2' })
-  check('setup.auto reports failure instead of pinning a dead channel', autoFailed.ok === false && autoFailed.pinned.length === 0, JSON.stringify(autoFailed))
-  check('setup.auto explains itself', autoFailed.error.length > 0, autoFailed.error)
-  check('a failed setup still returns the full shape', autoFailed.channels.length === 0 && autoFailed.summary !== undefined && autoFailed.available.length === 0)
-  stub.broken = []
-
   const panelReset = await panel['model.reset']({ model: 'cline-pass/glm-5.2' })
   check('model.reset returns the model to automatic routing', panelReset.pin.upstreams.length === 0 && panelReset.pin.exclude.length === 0, JSON.stringify(panelReset.pin))
 
@@ -882,7 +1086,15 @@ try {
   const panelHistory = await panel.history({ limit: 3 })
   check('history returns the most recent rows only', panelHistory.entries.length <= 3 && panelHistory.total > 0, JSON.stringify(panelHistory.total))
   check('history rows carry the model and latency', panelHistory.entries.every((entry) => entry.model !== '' && Number.isSafeInteger(entry.ms)))
-  check('history rows carry the account that served the call', panelHistory.entries.some((entry) => entry.account === 'default') && panelHistory.entries.every((entry) => typeof entry.account === 'string'), JSON.stringify(panelHistory.entries.map((entry) => entry.account)))
+  // The panel projects the same rows the tool returns, both timing marks
+  // included; the two lists must not disagree about what a request cost.
+  check('the panel history carries the first-chunk time too', panelHistory.entries.every((entry) => Number.isSafeInteger(entry.ttft) && entry.ttft >= 0), JSON.stringify(panelHistory.entries.map((entry) => entry.ttft)))
+  check('the panel history carries the first-byte time too', panelHistory.entries.every((entry) => Number.isSafeInteger(entry.ttfb) && entry.ttfb >= 0), JSON.stringify(panelHistory.entries.map((entry) => entry.ttfb)))
+  // The token counts and the "was usage reported" flag have to survive the
+  // projection too, or the panel renders a dash for a call that reported usage.
+  check('the panel history carries the token counts too', panelHistory.entries.every((entry) => typeof entry.usageReported === 'boolean' && Number.isSafeInteger(entry.usage?.inputTokens ?? NaN)), JSON.stringify(panelHistory.entries.map((entry) => entry.usage)))
+  check('the panel history carries the reasoning effort too', panelHistory.entries.every((entry) => typeof entry.effort === 'string'))
+  check('a panel row never reports a later first chunk than its total', panelHistory.entries.every((entry) => entry.ttft === 0 || entry.ttft <= entry.ms))
 
   let panelRejected = ''
   try {
@@ -941,6 +1153,44 @@ try {
   check('a failure carries no Host object', rpcBadArgs.json.error.details !== undefined && JSON.stringify(rpcBadArgs.json.error.details) === '{}', JSON.stringify(rpcBadArgs.json.error.details))
   const malformed = await route.fetch(new Request(`http://localhost${PANEL_PATH}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: 'not json' }))
   check('a malformed body is a 400, not a crash', malformed.status === 400, String(malformed.status))
+
+  // ── request image preparation & tool-result images ──────────────────────
+  let targetReceived = null
+  const dummyRef = { attachmentId: 'att-smoke-1', mediaType: 'image/png', bytes: 100, width: 1080, height: 2400 }
+  const mockAttachments = {
+    readImageRequest: async (ref, target) => {
+      targetReceived = target
+      return { attachment: ref, variantId: 'v1', mediaType: 'image/png', bytes: 20, data: Uint8Array.of(1, 2) }
+    },
+  }
+  const imgMessages = [
+    { role: 'user', content: [{ type: 'text', text: 'hi' }, { type: 'image', attachment: dummyRef }] },
+  ]
+  const prepared = await prepareRequestImages(imgMessages, mockAttachments, DEFAULT_REQUEST_IMAGE_POLICY)
+  check('prepareRequestImages projects positive integer width', Number.isSafeInteger(targetReceived?.width) && targetReceived.width > 0, String(targetReceived?.width))
+  check('prepareRequestImages projects positive integer height', Number.isSafeInteger(targetReceived?.height) && targetReceived.height > 0, String(targetReceived?.height))
+  check('prepareRequestImages includes positive integer maxBytes', Number.isSafeInteger(targetReceived?.maxBytes) && targetReceived.maxBytes > 0, String(targetReceived?.maxBytes))
+
+  const toolMessages = [
+    { role: 'user', content: [{ type: 'text', text: 'run' }] },
+    { role: 'assistant', content: [{ type: 'tool-call', id: 'call-1', name: 'read_image', arguments: '{}' }] },
+    {
+      role: 'user',
+      content: [{
+        type: 'tool-result',
+        toolCallId: 'call-1',
+        content: [{ type: 'text', text: 'read ok' }, { type: 'image', attachment: dummyRef }],
+      }],
+    },
+  ]
+  const toolPrepared = await prepareRequestImages(toolMessages, mockAttachments, DEFAULT_REQUEST_IMAGE_POLICY)
+  const toolBody = buildRequestBody({ model: 'cline-pass/deepseek-v4.1-flash', messages: toolMessages }, {}, toolPrepared)
+  const toolWire = toolBody.messages
+  const toolIndex = toolWire.findIndex(m => m.role === 'tool')
+  const imgUserIndex = toolWire.findIndex(m => m.role === 'user' && Array.isArray(m.content) && m.content.some(p => p.type === 'image_url'))
+  check('tool message is emitted', toolIndex !== -1, JSON.stringify(toolWire))
+  check('tool-result image rides a following user message', imgUserIndex > toolIndex, `tool=${toolIndex} imgUser=${imgUserIndex}`)
+  check('tool-result image has data URI url', toolWire[imgUserIndex]?.content?.some(p => p.type === 'image_url' && p.image_url?.url?.startsWith('data:image/png;base64,')), JSON.stringify(toolWire[imgUserIndex]))
 } catch (error) {
   failures.push(`unexpected failure — ${error?.stack ?? error}`)
 }

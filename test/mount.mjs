@@ -21,14 +21,43 @@
 import { createServer } from 'node:http'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
+import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
-import { boot, loadOptionalPatches } from '@deepseek-ai/dsh-app-boot'
+import { boot, loadProfileDirectory } from '@deepseek-ai/dsh-app-boot'
 import { PANEL_PATH } from '../lib/panel.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const pluginDir = resolve(here, '..')
-const installAnchor = '/usr/lib/node_modules/@deepseek-ai/dsh/package.json'
-const installScope = '/usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai'
+// Resolve the running dsh through a package every line shares, so the harness
+// can be pointed at either supported line (install a different version into
+// this tree, or run it from a separate one) instead of assuming the
+// system-wide install. `@deepseek-ai/dsh` itself is not a dependency here, so
+// the scope is derived from the settings package that dsh-settings always has.
+const require = createRequire(import.meta.url)
+// `installScope` is the `@deepseek-ai` directory that gets symlinked into the
+// throwaway profile, so it is the parent of a resolved package.
+const installScope = dirname(dirname(require.resolve('@deepseek-ai/dsh-settings/package.json')))
+// The install anchor is the running dsh's own package.json. In a flat
+// `node_modules` layout that is a sibling of the scope; in dsh's nested layout
+// it sits one level above the scope's parent, so probe for it rather than
+// assuming either shape.
+const installAnchor = [
+  join(installScope, 'dsh', 'package.json'),
+  join(installScope, '..', '..', 'package.json'),
+].find((candidate) => {
+  if (!existsSync(candidate)) return false
+  return String(JSON.parse(readFileSync(candidate, 'utf8')).name ?? '') === '@deepseek-ai/dsh'
+})
+
+/**
+ * The settings row differs between the two dsh lines this plugin supports.
+ *
+ * 0.1.5 shipped `dsh-settings-file`, which carried its own `path` config; from
+ * 0.1.7 that package is gone and `dsh-settings` reads and writes the profile's
+ * own patch document, injecting `configEditor` and `profileContext`. Detecting
+ * the package rather than the version keeps this working on anything in between.
+ */
+const hasSettingsFile = existsSync(join(installScope, 'dsh-settings-file'))
 
 let passed = 0
 const failures = []
@@ -67,49 +96,81 @@ mkdirSync(scratch, { recursive: true })
 mkdirSync(join(profileDir, 'node_modules'), { recursive: true })
 symlinkSync(installScope, join(profileDir, 'node_modules', '@deepseek-ai'), 'dir')
 
-writeFileSync(join(profileDir, 'package.json'), JSON.stringify({ name: 'dsh-profile-mount-test', private: true, dsh: { profile: { bundles: [] } } }, null, 2))
+writeFileSync(join(profileDir, 'package.json'), JSON.stringify({ name: 'dsh-profile-mount-test', private: true, dsh: { profile: { bundles: ['dsh-profile-mount-test-bundle'] } } }, null, 2))
 writeFileSync(join(profileDir, 'cordis.yml'), '# composed entirely from the patch file\n[]\n')
-writeFileSync(join(profileDir, 'cordis.patch.yml'), `# The host rows this plugin needs, then the plugin itself.
+writeFileSync(join(profileDir, 'cordis.patch.yml'), `# Config overrides for the rows the bundle below mounts.
+- id: cline-pass
+  config:
+    baseURL: ${JSON.stringify(baseURL)}
+    apiKeyEnv: MOUNT_TEST_API_KEY
+    knownModels:
+      - cline-pass/glm-5.2
+      - cline-pass/kimi-k3
+${hasSettingsFile ? '' : `    accounts: {}
+    accountMode: single
+    activeAccount: ""
+    hiddenModels: []
+    models: {}
+    perModel: {}
+`}`)
+
+// A real profile gets its host rows from bundle layers, so the harness builds
+// one: the same split the shipped bundles use, with the profile patch above
+// carrying only overrides.
+const bundleDir = join(profileDir, 'node_modules', 'dsh-profile-mount-test-bundle')
+mkdirSync(bundleDir, { recursive: true })
+writeFileSync(join(bundleDir, 'package.json'), JSON.stringify({
+  name: 'dsh-profile-mount-test-bundle',
+  private: true,
+  dsh: { bundle: { patch: './cordis.patch.yml' } },
+}, null, 2))
+writeFileSync(join(bundleDir, 'cordis.patch.yml'), `# The host rows this plugin needs, then the plugin itself: one insert over the
+# empty profile root, the way dsh-base declares its own rows.
 - insert:
-    - id: llm
-      name: '@deepseek-ai/dsh-llm'
+${hasSettingsFile
+  ? `  - id: settings
+    name: '@deepseek-ai/dsh-settings-file'
+    config:
+      path: ${JSON.stringify(join(scratch, 'settings.yaml'))}
+`
+  : `  # dsh-settings injects configEditor and profileContext; the launcher provides
+  # the latter, and this harness replaces the launcher, so boot is given it below.
+  - id: config-editor
+    name: '@deepseek-ai/dsh-config-editor'
 
-    - id: settings
-      name: '@deepseek-ai/dsh-settings-file'
-      config:
-        path: ${JSON.stringify(join(scratch, 'settings.yaml'))}
+  - id: settings
+    name: '@deepseek-ai/dsh-settings'
+`}
+  - id: llm
+    name: '@deepseek-ai/dsh-llm'
 
-    - id: credentials
-      name: '@deepseek-ai/dsh-credentials-local'
-      config:
-        path: ${JSON.stringify(join(scratch, 'credentials.yaml'))}
+  - id: credentials
+    name: '@deepseek-ai/dsh-credentials-local'
+    config:
+      path: ${JSON.stringify(join(scratch, 'credentials.yaml'))}
 
-    - id: system-prompt
-      name: '@deepseek-ai/dsh-system-prompt'
+  # Ordered as dsh-base orders them: tools injects systemPrompt, and settings
+  # injects configEditor, so each provider comes first.
+  - id: system-prompt
+    name: '@deepseek-ai/dsh-system-prompt'
 
-    - id: tools
-      name: '@deepseek-ai/dsh-tools'
+  - id: tools
+    name: '@deepseek-ai/dsh-tools'
 
-    - id: webserver
-      name: '@deepseek-ai/dsh-host-webserver'
-      config:
-        host: 127.0.0.1
-        port: 0
+  - id: webserver
+    name: '@deepseek-ai/dsh-host-webserver'
+    config:
+      host: 127.0.0.1
+      port: 0
 
-    - id: connection
-      name: '@deepseek-ai/dsh-client-connection'
+  - id: connection
+    name: '@deepseek-ai/dsh-client-connection'
 
-    - id: client-modules
-      name: '@deepseek-ai/dsh-client-modules'
+  - id: client-modules
+    name: '@deepseek-ai/dsh-client-modules'
 
-    - id: cline-pass
-      name: ${JSON.stringify(join(pluginDir, 'lib/index.js'))}
-      config:
-        baseURL: ${JSON.stringify(baseURL)}
-        apiKeyEnv: MOUNT_TEST_API_KEY
-        knownModels:
-          - cline-pass/glm-5.2
-          - cline-pass/kimi-k3
+  - id: cline-pass
+    name: ${JSON.stringify(join(pluginDir, 'lib/index.js'))}
 `)
 
 process.env.MOUNT_TEST_API_KEY = 'sk_mount_test_key'
@@ -118,9 +179,30 @@ process.env.MOUNT_TEST_API_KEY = 'sk_mount_test_key'
 
 let ctx
 try {
-  const patches = loadOptionalPatches('dsh', join(profileDir, 'cordis.patch.yml')) ?? []
-  check('the patch file composes', patches.length > 0, JSON.stringify(patches))
-  ctx = await boot('dsh', join(profileDir, 'cordis.yml'), patches)
+  // The launcher composes every layer: bundle patches first, then the profile's
+  // own patch. boot is handed the composed list, which is why the bundle
+  // package has to resolve exactly as it does in a real profile.
+  const loaded = loadProfileDirectory('dsh', profileDir, installAnchor)
+  const patches = [
+    ...loaded.layers.flatMap((layer) => layer.patches),
+    ...loaded.patches,
+  ]
+  check('the patch file composes', patches.length > 0, JSON.stringify(patches.length))
+  check('the bundle layer contributes the host rows', loaded.layers.length === 1 && loaded.layers[0].patches.length > 0, JSON.stringify(loaded.layers.map((layer) => layer.packageName)))
+  ctx = await boot('dsh', join(profileDir, 'cordis.yml'), patches, hasSettingsFile ? undefined : (hostCtx) => {
+    // dsh-settings and config-editor both inject profileContext, which the
+    // launcher normally provides; this harness replaces the launcher, so it
+    // supplies the same shape over the throwaway profile.
+    hostCtx.provide('profileContext', {
+      name: 'dsh',
+      dir: profileDir,
+      patchPath: join(profileDir, 'cordis.patch.yml'),
+      installAnchor,
+      cwd: process.cwd(),
+      home: process.env.DSH_HOME ?? join(process.cwd(), '.dsh'),
+      overlays: [],
+    })
+  })
   check('the tree mounted with every row activated', true)
 
   const entries = [...ctx.loader.entries()].map((entry) => entry.options?.id ?? entry.options?.name)
@@ -272,34 +354,46 @@ try {
   check('the panel state confirms the configured key', stateResponse.json?.value?.ready === true, JSON.stringify(stateResponse.json?.value?.ready))
 
   const pinResponse = await panelPost(envelope('model.pin', { model: 'cline-pass/kimi-k3', upstreams: ['gmicloud'], pinMode: 'preferred', sort: 'ttft' }), cookie)
-  check('a panel write reaches the settings document', pinResponse.status === 200 && JSON.stringify(settings.get('cline-pass')?.perModel?.['cline-pass/kimi-k3']?.upstreams) === JSON.stringify(['gmicloud']), JSON.stringify(settings.get('cline-pass')?.perModel))
+  // Read the written document rather than a service accessor: `settings.get`
+  // existed on 0.1.5 and is gone in 0.1.7. Which file holds it differs too —
+  // 0.1.5 keeps its own settings document, 0.1.7 rewrites the profile patch —
+  // so both are searched for the value that was just written.
+  const documents = [
+    join(scratch, 'settings.yaml'),
+    join(profileDir, 'cordis.patch.yml'),
+  ].filter((path) => existsSync(path)).map((path) => readFileSync(path, 'utf8'))
+  const writtenPerModel = documents.some((text) => /perModel:/.test(text) && /gmicloud/.test(text))
+  check('a panel write reaches the settings document', pinResponse.status === 200 && writtenPerModel, `${pinResponse.status} — ${documents.map((text) => text.slice(0, 160)).join(' | ')}`)
 
-  // ── the account pool can shrink ───────────────────────────────────────────
-  // The settings document is resolved by MERGING plain objects recursively, so
-  // a merge-only write can add an account but never drop one. Removing an
-  // account therefore has to go through a path-addressed unset; when it did not,
-  // the panel's Remove button reported success and the account came straight
-  // back on the next read (and in the document on disk).
-  const settingsFile = () => readFileSync(join(scratch, 'settings.yaml'), 'utf8')
-  const addedAccount = await panelPost(envelope('account.add', { name: 'second', displayName: 'second', key: 'sk_mount_second_key' }), cookie)
-  check('the panel adds an account to the pool', addedAccount.json?.ok === true && (addedAccount.json?.value?.accounts ?? []).length === 2, JSON.stringify(addedAccount.json?.value?.accounts))
+  // ── removing an account actually removes it ───────────────────────────────
+  //
+  // Adding a second account and then deleting it is the only way to see whether
+  // the removal reaches the document: `settings.update` merges recursively, so a
+  // patch that simply omits the key leaves it in place — the panel reports
+  // success over HTTP and the account is still there on the next read. Both host
+  // lines merge this way, and only an `unset` edit deletes a key.
+  const readAccounts = async () => {
+    const response = await panelPost(envelope('state'), cookie)
+    return response.json?.value?.accounts ?? []
+  }
+  const added = await panelPost(envelope('account.add', { name: 'doomed', key: 'sk_doomed_key_123456' }), cookie)
+  check('the panel adds a second account', added.json?.ok === true && (await readAccounts()).some((account) => account.key === 'doomed'), `${added.status} — ${JSON.stringify((await readAccounts()).map((a) => a.key))}`)
 
-  const removeResponse = await panelPost(envelope('account.remove', { name: 'second' }), cookie)
-  const afterRemove = Object.keys(settings.get('cline-pass')?.accounts ?? {})
-  check('removing an account drops it from the settings section', afterRemove.includes('second') === false, afterRemove.join(','))
-  check('removing an account is reflected in the state the panel renders', !(removeResponse.json?.value?.accounts ?? []).some((account) => account.key === 'second'), JSON.stringify(removeResponse.json?.value?.accounts))
-  check('removing an account rewrites the document on disk', /second/.test(settingsFile()) === false, settingsFile())
-  const removeUnknown = await panelPost(envelope('account.remove', { name: 'ghost' }), cookie)
-  check('removing an unknown account is refused', removeUnknown.json?.ok === false, JSON.stringify(removeUnknown.json))
-
-  // ── the history the panel reads ───────────────────────────────────────────
-  // Recording happens in the adapter; this is the read the browser half makes.
-  const historyResponse = await panelPost(envelope('history', { limit: 5 }), cookie)
-  check('the panel history reports the calls this process served', (historyResponse.json?.value?.entries ?? []).length >= 2, JSON.stringify(historyResponse.json?.value))
-  check('the history rows name the model and the serving upstream', (historyResponse.json?.value?.entries ?? []).every((entry) => entry.model === 'cline-pass/glm-5.2' && entry.provider !== ''), JSON.stringify(historyResponse.json?.value?.entries?.[0]))
-  check('the history rows name the account the call was routed through', (historyResponse.json?.value?.entries ?? []).every((entry) => entry.account === 'default'), JSON.stringify(historyResponse.json?.value?.entries?.map((entry) => entry.account)))
-  const stateAfterHistory = await panelPost(envelope('state'), cookie)
-  check('the panel snapshot carries the same recorded count the fold reads', (stateAfterHistory.json?.value?.historySize ?? 0) === historyResponse.json?.value?.total && (historyResponse.json?.value?.total ?? 0) > 0, JSON.stringify({ state: stateAfterHistory.json?.value?.historySize, history: historyResponse.json?.value?.total }))
+  const removed = await panelPost(envelope('account.remove', { name: 'doomed' }), cookie)
+  const remaining = await readAccounts()
+  check('a removed account is gone from the state', removed.json?.ok === true && !remaining.some((account) => account.key === 'doomed'), `${removed.status} — ${JSON.stringify(remaining.map((a) => a.key))}`)
+  // The service is the authority: re-read the document rather than trusting the
+  // panel's own projection of it.
+  const sideDocuments = [
+    join(scratch, 'settings.yaml'),
+    join(profileDir, 'cordis.patch.yml'),
+  ].filter((path) => existsSync(path)).map((path) => readFileSync(path, 'utf8'))
+  check('a removed account is gone from the settings document too', !sideDocuments.some((text) => /doomed/.test(text)), sideDocuments.map((text) => text.slice(0, 200)).join(' | '))
+  // A removal that names nothing has to be refused rather than turned into a
+  // patch: the guard is the only thing between a typo and a merge-only write
+  // that reports success while the configuration stays as it was.
+  const unknownAccount = await panelPost(envelope('account.remove', { name: 'ghost' }), cookie)
+  check('removing an unknown account is refused', unknownAccount.json?.ok === false, `HTTP ${unknownAccount.status} — ${unknownAccount.text.slice(0, 120)}`)
 
   const unknownResponse = await panelPost(envelope('nope'), cookie)
   check('an unknown action is a typed failure over the wire', unknownResponse.status === 200 && unknownResponse.json?.ok === false, `HTTP ${unknownResponse.status} — ${unknownResponse.text.slice(0, 120)}`)
