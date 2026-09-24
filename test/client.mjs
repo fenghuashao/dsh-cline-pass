@@ -70,54 +70,34 @@ function renderNode(node, depth = 0) {
 /**
  * Run one function component for real.
  *
- * Components reach React through `require('react')`, never through props, so
- * the seed table hands out ONE shared stand-in and it keeps its hook slots
- * across renders — that is what lets a test drive a single interaction (opening
- * the history fold) and re-render to see what the panel did with the answer.
- * `useEffect` is captured but never run: the reads it would trigger need a live
- * host, and nothing here asserts anything about them.
+ * Hooks are stubbed with a per-call cursor: `useState` returns the initial
+ * value and a no-op setter, and `useEffect` is skipped (its callback is
+ * captured so a test can assert it does not throw on its own). This is enough
+ * to execute every branch a first render takes.
  */
-const CLIENT_REACT = {
-  createElement,
-  Fragment: Symbol('Fragment'),
-  useState(initial) {
-    const index = CLIENT_REACT.__cursor++
-    if (!(index in CLIENT_REACT.__slots)) CLIENT_REACT.__slots[index] = typeof initial === 'function' ? initial() : initial
-    return [CLIENT_REACT.__slots[index], (next) => { CLIENT_REACT.__slots[index] = typeof next === 'function' ? next(CLIENT_REACT.__slots[index]) : next }]
-  },
-  useEffect(callback) { CLIENT_REACT.__effects.push(callback) },
-  useMemo(factory) { CLIENT_REACT.__cursor += 1; return factory() },
-  useRef(initial) { CLIENT_REACT.__cursor += 1; return { current: initial } },
-  useCallback(callback) { CLIENT_REACT.__cursor += 1; return callback },
-  __slots: [],
-  __effects: [],
-  __cursor: 0,
-}
-
-/** Render one component with the hook cursor reset, as React would. */
 function runComponent(component, props) {
-  CLIENT_REACT.__cursor = 0
-  CLIENT_REACT.__effects = []
-  const tree = renderNode(component({ ...props, React: CLIENT_REACT }))
-  return { tree, effects: CLIENT_REACT.__effects }
-}
-
-/** Find the first rendered host element a predicate accepts. */
-function findNode(node, predicate) {
-  if (node === null || node === undefined || typeof node !== 'object') return null
-  if (Array.isArray(node)) {
-    for (const child of node) {
-      const hit = findNode(child, predicate)
-      if (hit !== null) return hit
-    }
-    return null
+  const effects = []
+  let cursor = 0
+  const slots = []
+  const React = {
+    createElement,
+    Fragment: Symbol('Fragment'),
+    useState(initial) {
+      const index = cursor++
+      if (!(index in slots)) slots[index] = typeof initial === 'function' ? initial() : initial
+      return [slots[index], (next) => { slots[index] = typeof next === 'function' ? next(slots[index]) : next }]
+    },
+    useEffect(callback) { effects.push(callback) },
+    useMemo(factory) { cursor += 1; return factory() },
+    useRef(initial) { cursor += 1; return { current: initial } },
+    useCallback(callback) { cursor += 1; return callback },
   }
-  if (node.fragment !== undefined) return findNode(node.fragment, predicate)
-  if (node.tag !== undefined) return predicate(node) ? node : findNode(node.children ?? [], predicate)
-  return findNode(node.children ?? [], predicate)
+  const tree = renderNode(component({ ...props, React }))
+  return { tree, effects }
 }
 
-/** A window/require harness shaped like the browser module system. */
+// ── a window/require harness shaped like the browser module system ──────────
+
 const registered = []
 
 /** The platform seed words the shell actually provides (see dsh-client-modules). */
@@ -138,9 +118,63 @@ const windowStub = {
 
 let missingRequires = []
 
-function makeRequire() {
+// The platform seed table publishes more than React; the plugin draws its
+// disclosure chevrons with the shared primitives, so the stub answers that
+// specifier too rather than recording it as a missing external.
+//
+// The icon export was renamed between host lines, so the stub below is the
+// 0.1.2–0.1.5 shape (`…Outline14`) and the postures further down cover the two
+// other shapes a host can present. `stableChevronCalls` proves this shape is
+// the one actually used, not merely tolerated.
+const PRIMITIVES_SPECIFIER = '@deepseek-ai/dsh-client-ui-primitives'
+
+/**
+ * A primitives face whose chevron records the exact export name it was read by.
+ *
+ * Asserting only that "a host icon was used" cannot tell a correct resolution
+ * from one that silently falls through to a lower-preference name — both draw a
+ * host icon. Each name below reports itself so the test can name the winner.
+ */
+function taggedPrimitives(names, picked) {
+  const face = {}
+  for (const name of names) face[name] = () => { picked.push(name); return null }
+  return face
+}
+let stableChevronCalls = 0
+const primitivesStub = {
+  IconChevronDownOutline14: () => {
+    stableChevronCalls += 1
+    return null
+  },
+}
+
+/** Effect callbacks the bundle's React stub captured, in render order. */
+const collectedEffects = []
+
+function makeRequire(primitives = primitivesStub) {
+  const React = {
+    createElement,
+    Fragment: Symbol('Fragment'),
+    // A boolean is this panel's disclosure state: the plugin card, the account
+    // card and every model row fold with one. The stub opens them so those
+    // bodies are part of the rendered tree — a collapsed card renders its
+    // header alone, and the copy asserted below lives in the body.
+    useState: (initial) => {
+      const value = typeof initial === 'function' ? initial() : initial
+      return [value === false ? true : value, () => {}]
+    },
+    // Effects are where the panel reaches for its actions, and they run after
+    // the first paint — outside every error boundary the render assertions
+    // exercise. Collect them so a test can run them: a face advertising an
+    // action the controller no longer defines calls it from here, and the throw
+    // takes the whole panel down without failing any render assertion.
+    useEffect: (callback) => { collectedEffects.push(callback) },
+    useMemo: (factory) => factory(),
+    useRef: () => ({ current: undefined }),
+  }
   return (specifier) => {
-    if (specifier === 'react') return CLIENT_REACT
+    if (specifier === 'react') return React
+    if (specifier === PRIMITIVES_SPECIFIER) return primitives
     missingRequires.push(specifier)
     throw new Error(`client-modules: require("${specifier}") missed the module table`)
   }
@@ -239,11 +273,15 @@ try {
 check('apply() runs without throwing', applyError === null, applyError?.message ?? '')
 
 const keys = registrations.map((registration) => `${registration.options.name}:${registration.options.key ?? registration.options.id ?? ''}`)
-check('every declared slot is registered', registrations.length === 3, keys.join(' '))
-check('a Settings page is registered', registrations.some((registration) => registration.options.name === 'settings.section' && registration.options.id === 'cline-pass'), keys.join(' '))
-check('a Plugins card is registered', registrations.some((registration) => registration.options.name === 'settings.plugin.item' && registration.options.key === 'cline-pass'), keys.join(' '))
+check('every declared slot is registered', registrations.length === 2, keys.join(' '))
+check('a Plugins tab is registered', registrations.some((registration) => registration.options.name === 'settings.plugins.tab' && registration.options.id === 'cline-pass'), keys.join(' '))
 check('a Models-page card is registered', registrations.some((registration) => registration.options.name === 'settings.models.provider-card' && registration.options.key === 'cline-pass'), keys.join(' '))
-check('the settings section carries a nav label thunk', typeof registrations.find((registration) => registration.options.name === 'settings.section')?.options.label === 'function')
+// `settings.plugins.tab` is a list slot ordered by `order`; the host's own
+// inventory tab sits at 10, so the route's tab is placed after it.
+check('the Plugins tab carries an order and a locale label thunk', registrations.find((registration) => registration.options.name === 'settings.plugins.tab')?.options.order === 20 && typeof registrations.find((registration) => registration.options.name === 'settings.plugins.tab')?.options.label === 'function', keys.join(' '))
+// One surface, not two: the panel lives in the Plugins tab alone, so no
+// Settings-nav entry duplicates it.
+check('no Settings page duplicates the Plugins panel', !registrations.some((registration) => registration.options.name === 'settings.section'), keys.join(' '))
 
 // ── the panel's own copy follows the active locale ──────────────────────────
 
@@ -259,24 +297,6 @@ function collectText(node) {
   return own.flatMap(collectText)
 }
 
-/**
- * Collect the text of a RENDERED tree (what `renderNode` returned).
- *
- * {@link collectText} walks the raw element tree, where a function component's
- * own children are whatever was passed to it — usually nothing — so its output
- * is invisible. Anything asserted about a component's body has to read the
- * rendered children instead.
- */
-function collectRenderedText(node) {
-  if (node === null || node === undefined || typeof node === 'boolean') return []
-  if (typeof node === 'string' || typeof node === 'number') return [String(node)]
-  if (Array.isArray(node)) return node.flatMap(collectRenderedText)
-  if (node.fragment !== undefined) return collectRenderedText(node.fragment)
-  if (node.text !== undefined) return [String(node.text)]
-  const props = node.props ?? {}
-  return [node.children ?? [], props.title, props.placeholder, props['aria-label']].flat(Infinity).flatMap(collectRenderedText)
-}
-
 /** A locale stand-in whose namespace lookup echoes keys, as an unregistered one does. */
 function echoingLocale(active) {
   return {
@@ -287,27 +307,161 @@ function echoingLocale(active) {
   }
 }
 
-const sectionRegistrationForText = registrations.find((registration) => registration.options.name === 'settings.section')
+/**
+ * Expand function components so a nested body is part of the tree.
+ *
+ * `runComponent` invokes the top-level component only, and this card keeps the
+ * panel one level down (the disclosure body). Collecting text without expanding
+ * would see the card's header alone.
+ */
+function resolveComponents(node) {
+  if (node === null || node === undefined || typeof node !== 'object') return node
+  if (Array.isArray(node)) return node.map(resolveComponents)
+  if (typeof node.type === 'function') return resolveComponents(node.type(node.props))
+  return { ...node, props: { ...node.props, children: resolveComponents(node.props?.children) } }
+}
 
-function renderSectionText() {
-  return collectText(runComponent(sectionRegistrationForText.component, propsFor(sectionRegistrationForText)).tree).join(' ')
+// The Plugins tab is the one configuration surface, and it is a disclosure the
+// stub above opens, so its body — the panel — is what this renders.
+const cardRegistrationForText = registrations.find((registration) => registration.options.name === 'settings.plugins.tab')
+
+function renderCardText() {
+  return collectText(resolveComponents(runComponent(cardRegistrationForText.component, propsFor(cardRegistrationForText)).tree)).join(' ')
+}
+
+/**
+ * Every element in a rendered tree whose handler text matches.
+ *
+ * The delete button's disabled state is the thing being checked, and it is not
+ * visible in the collected copy: a disabled button still renders its label.
+ */
+function findButtons(node, label, found = []) {
+  if (node === null || node === undefined || typeof node !== 'object') return found
+  if (Array.isArray(node)) { for (const child of node) findButtons(child, label, found); return found }
+  const children = node.props?.children
+  if (node.type === 'button' && collectText(children).includes(label)) found.push(node)
+  findButtons(children, label, found)
+  return found
 }
 
 // A namespace the shared registry knows nothing about makes `locale.bind` echo
 // the key back rather than throw. The panel must still render its own copy.
+//
+// These assertions name copy that renders before any read has answered: the
+// card header and the panel's status line. The sections below the status line
+// wait for the route to be configured, so they are not part of this tree — the
+// store starts in its loading state here because effects are captured, not run.
 stubLocale = echoingLocale('zh')
-const chinese = renderSectionText()
-check('an unresolved locale lookup still renders Chinese copy', chinese.includes('尚未配置 API Key') && chinese.includes('最近请求'), chinese.slice(0, 160))
-check('no raw i18n key leaks into the rendered panel', !/\bkeyMissing\b|\bnotReady\b|\bautoSetup\b|\bhistory\b/.test(chinese), chinese.slice(0, 200))
+const chinese = renderCardText()
+check('an unresolved locale lookup still renders Chinese copy', chinese.includes('尚未配置 API Key') && chinese.includes('订阅模型的渠道钉住'), chinese.slice(0, 160))
+check('no raw i18n key leaks into the rendered panel', !/\bkeyMissing\b|\bhistory\b|\busageTitle\b/.test(chinese), chinese.slice(0, 200))
 
 stubLocale = echoingLocale('en')
-const english = renderSectionText()
-check('an English locale renders English copy', english.includes('No API key') && english.includes('Recent requests'), english.slice(0, 160))
+const english = renderCardText()
+check('an English locale renders English copy', english.includes('No API key') && english.includes('Channel pins'), english.slice(0, 160))
 check('the two locales really differ', chinese !== english)
 
 // With no locale service at all the bundled Chinese dictionary is the default.
 stubLocale = undefined
-check('a composition without the locale service still renders Chinese', renderSectionText().includes('尚未配置 API Key'))
+check('a composition without the locale service still renders Chinese', renderCardText().includes('尚未配置 API Key'))
+
+// ── the loaded panel renders ────────────────────────────────────────────────
+//
+// The assertions above render the panel before any read has answered, so every
+// section below the status line is absent — a component that only throws once
+// real data reaches it (a renamed helper, a changed argument list) would pass
+// them all. This renders the whole panel against a fully populated snapshot,
+// which is the state a user actually looks at.
+{
+  const store = cardRegistrationForText.options.inject().hooks.clinePass
+  const snapshot = store.getSnapshot()
+  const accounts = [{ key: 'default', displayName: 'Cline Pass', apiKeyEnv: 'CLINE_PASS_API_KEY', enabled: true, declared: true, keyConfigured: true, keyHint: 'sk_liv…3456' }]
+  const models = [{ id: 'cline-pass/glm-5.2', hidden: false, pinned: ['alibaba'], excluded: ['baseten'], upstreams: ['alibaba', 'baseten'], upstreamStatus: [{ upstream: 'alibaba', status: 'ok', note: '' }], targets: ['alibaba'] }]
+  const usage = { fetchedAt: Date.now(), accounts: [{ account: 'default', ok: true, limits: [{ type: 'five_hour', percentUsed: 25, resetsAt: new Date(Date.now() + 3_600_000).toISOString() }, { type: 'weekly', percentUsed: 80, resetsAt: new Date(Date.now() + 86_400_000).toISOString() }, { type: 'made_up_window', percentUsed: 5, resetsAt: '' }] }] }
+  store.set({
+    ...snapshot,
+    status: 'ready',
+    data: {
+      provider: 'cline-pass', displayName: 'Cline Pass', baseURL: 'https://api.cline.bot/api/v1',
+      settingsAvailable: true, accountMode: 'single', activeAccount: '', ready: true,
+      accounts, models, pinnedModels: 1, hiddenModels: 0, catalogCount: 1, historySize: 2, usage,
+    },
+  })
+  let loaded = null
+  let loadedError = null
+  try {
+    loaded = collectText(resolveComponents(runComponent(cardRegistrationForText.component, propsFor(cardRegistrationForText)).tree)).join(' ')
+  } catch (error) {
+    loadedError = error
+  }
+  check('the fully loaded panel renders without throwing', loadedError === null, loadedError?.message ?? '')
+  check('the loaded panel shows the quota percentages', loaded !== null && loaded.includes('25%') && loaded.includes('80%'), (loaded ?? '').slice(0, 200))
+  check('the loaded panel names an unknown window verbatim', loaded !== null && loaded.includes('made_up_window'), (loaded ?? '').slice(0, 300))
+  check('the loaded panel shows the pinned channel', loaded !== null && loaded.includes('alibaba'), (loaded ?? '').slice(0, 300))
+  check('the loaded panel leaks no raw key', loaded !== null && !/keyMissing$|\bdata\b:/.test(loaded), (loaded ?? '').slice(0, 200))
+  store.set(snapshot)
+}
+
+// ── the user's path: open the tab, let the effects run, show the data ───────
+//
+// This is the sequence that shipped broken. A real mount renders with no data,
+// runs its effects to start the first read, renders again once that read lands,
+// and starts its remaining reads from there — the guard in each effect means the
+// reads only happen on the second pass. The tab's header renders fine
+// throughout, so a closed card looks healthy; the failure appears only after the
+// body mounts and its later effects run, where a throw retires the slot entry and
+// leaves an empty tabpanel rather than an error.
+{
+  const savedFetch = globalThis.fetch
+  const payload = {
+    provider: 'cline-pass', displayName: 'Cline Pass', baseURL: 'https://api.cline.bot/api/v1',
+    settingsAvailable: true, accountMode: 'single', activeAccount: 'default', ready: true,
+    accounts: [{ key: 'default', displayName: 'Cline Pass', apiKeyEnv: 'CLINE_PASS_API_KEY', enabled: true, declared: true, keyConfigured: true, keyHint: 'sk_liv…3456' }],
+    models: [{ id: 'cline-pass/glm-5.2', hidden: false, pinned: ['alibaba'], excluded: [], upstreams: ['alibaba'], upstreamStatus: [], targets: ['alibaba'] }],
+    pinnedModels: 1, hiddenModels: 0, catalogCount: 1, historySize: 1,
+    usage: { fetchedAt: Date.now(), accounts: [{ account: 'default', ok: true, limits: [{ type: 'five_hour', percentUsed: 42, resetsAt: new Date(Date.now() + 60_000).toISOString() }] }] },
+    entries: [], total: 0,
+  }
+  globalThis.fetch = async () => ({ ok: true, async json() { return { ok: true, value: payload } } })
+
+  const store = cardRegistrationForText.options.inject().hooks.clinePass
+  store.set({ status: 'loading', error: null, data: null, busy: null, notice: null, action: null })
+
+  const failures = []
+  const runEffects = () => {
+    const collected = []
+    // The stub collects into one module-level array, so drain it per pass.
+    collectedEffects.length = 0
+    runComponent(cardRegistrationForText.component, propsFor(cardRegistrationForText))
+    collected.push(...collectedEffects)
+    collectedEffects.length = 0
+    for (const effect of collected) {
+      try { effect() } catch (error) { failures.push(error?.message ?? String(error)) }
+    }
+    return collected.length
+  }
+
+  // First pass: no data yet, so only the mount read starts.
+  const firstPass = runEffects()
+  for (let tick = 0; tick < 8; tick += 1) await new Promise((resolve) => { setTimeout(resolve, 0) })
+  check('opening the tab starts a read', firstPass > 0, String(firstPass))
+
+  // Second pass: the read landed, so the remaining effects run — this is where
+  // an action the face advertises but the controller no longer defines throws.
+  const secondPass = runEffects()
+  for (let tick = 0; tick < 8; tick += 1) await new Promise((resolve) => { setTimeout(resolve, 0) })
+  check('the reads that follow the first one all run', failures.length === 0, failures.join(' | '))
+  check('the panel re-reads once its data lands', secondPass > 0, String(secondPass))
+
+  const settled = collectText(resolveComponents(runComponent(cardRegistrationForText.component, propsFor(cardRegistrationForText)).tree)).join(' ')
+  check('the panel is populated after the reads settle', settled.includes('42%') && settled.includes('cline-pass/glm-5.2'), settled.slice(0, 200))
+  check('the settled panel renders no raw i18n key', !/\bkeyMissing\b|\bpanelUnavailable\b|\bexpand\b|\bcollapse\b/.test(settled), settled.slice(0, 200))
+
+  globalThis.fetch = savedFetch
+  // The store is shared across this file, and a later assertion checks its very
+  // first state, so hand it back the way it was found.
+  store.set({ status: 'loading', error: null, data: null, busy: null, notice: null, action: null })
+}
 
 // ── call every registered component ─────────────────────────────────────────
 
@@ -340,23 +494,198 @@ for (const registration of registrations) {
   check(`rendering ${label} produces a tree`, result.tree !== null && result.tree !== undefined)
   const serialized = JSON.stringify(result.tree)
   check(`rendering ${label} does not leak a Host object`, !serialized.includes('"rpc"') && !serialized.includes('Symbol('), serialized.slice(0, 120))
-  // Effects are captured, never run: the RPC read they trigger needs a live
-  // browser session, and running it here would assert nothing about rendering.
+  // The effects are where the panel reaches for its actions, and they run after
+  // the first paint — outside every error boundary the render assertions above
+  // exercise. A face advertising an action the controller no longer defines
+  // (calling `props.loadUsage()` on a deleted method) therefore blanks the real
+  // panel while all of those assertions still pass. Run them here instead.
   check(`rendering ${label} registers effects without throwing`, Array.isArray(result.effects))
+}
+
+// ── run the effects the first render registered ─────────────────────────────
+//
+// The stub collects them rather than running them, because a real mount runs
+// them right after paint. They are the only place some actions are reached, so a
+// face that advertises an action the controller no longer defines throws here —
+// after paint, where nothing catches it, blanking the whole panel while every
+// render assertion above still passes.
+{
+  const savedFetch = globalThis.fetch
+  globalThis.fetch = async () => ({ ok: true, async json() { return { ok: true, value: {} } } })
+  const thrown = []
+  for (const [index, effect] of collectedEffects.entries()) {
+    let cleanup = null
+    try {
+      cleanup = effect()
+    } catch (error) {
+      thrown.push(`[${index}] ${error?.message ?? error}`)
+    }
+    if (typeof cleanup === 'function') {
+      try { cleanup() } catch (error) { thrown.push(`[${index}] cleanup: ${error?.message ?? error}`) }
+    }
+  }
+  check('every effect the first render registered runs and cleans up', thrown.length === 0, thrown.join(' | '))
+  check('the first render registers at least one effect', collectedEffects.length > 0, String(collectedEffects.length))
+  globalThis.fetch = savedFetch
+}
+
+// ── the disclosure chevron across host icon sets ────────────────────────────
+//
+// The icon export was renamed between host lines: 0.1.2–0.1.5 ships
+// `IconChevronDownOutline14`, 0.1.6+ ships `…Regular` / `…Medium`. A bundle
+// that destructures one name and calls it crashes the whole panel on the other
+// host, so each posture below must still render, and the fallback must be a
+// real drawing rather than `undefined`.
+check('the 0.1.2–0.1.5 chevron export is the one used', stableChevronCalls > 0, String(stableChevronCalls))
+
+/** Render one registration under a given primitives module. */
+function renderWith(primitives, registration) {
+  const load = []
+  const win = {
+    __ModuleLoader__: { load: (e) => load.push(e) },
+    document: documentStub,
+  }
+  const previous = globalThis.window
+  globalThis.window = win
+  try {
+    const run = new Function('window', 'document', 'require', source)
+    run(win, documentStub, makeRequire(primitives))
+  } finally {
+    if (previous === undefined) delete globalThis.window
+    else globalThis.window = previous
+  }
+  const exportsUnderTest = load[0].factory(makeRequire(primitives))
+  const seen = []
+  const slots = {
+    inject: (key, callback) => { callback(); return () => {} },
+    register: (options, component) => { seen.push({ options, component }); return () => {} },
+  }
+  const ctx = {
+    logger: { info() {}, warn() {}, error() {} },
+    slots,
+    connection: connectionService,
+    effect: (body) => {
+      const dispose = body()
+      return typeof dispose === 'function' ? dispose : () => {}
+    },
+    get: (name) => (name === 'slots' ? slots : name === 'connection' ? connectionService : undefined),
+  }
+  exportsUnderTest.apply(ctx)
+  const target = seen.find((entry) => entry.options.name === registration)
+  if (target === undefined) return { tree: null, effects: [] }
+  return runComponent(target.component, propsFor(target))
+}
+
+for (const [label, names, expected] of [
+  // This is what the shipping host actually publishes, and the bundle used to
+  // omit the unsuffixed name — it silently fell back to a lower-preference one.
+  ['the shipping fan-out set', ['IconChevronDownOutline', 'IconChevronDownOutlineArtwork', 'IconChevronDownOutlineRegular', 'IconChevronDownOutlineMedium'], 'IconChevronDownOutline'],
+  ['0.1.2-0.1.5 single name', ['IconChevronDownOutline14'], 'IconChevronDownOutline14'],
+  ['an artwork/regular/medium triple', ['IconChevronDownOutlineRegular', 'IconChevronDownOutlineMedium'], 'IconChevronDownOutlineRegular'],
+  ['a seed table without any chevron icon', [], null],
+]) {
+  const picked = []
+  const primitives = taggedPrimitives(names, picked)
+  let result = null
+  try {
+    result = renderWith(primitives, 'settings.plugins.tab')
+  } catch (error) {
+    failures.push(`rendering the Plugins tab under ${label} threw: ${error?.message ?? error}`)
+    continue
+  }
+  check(`the Plugins tab renders under ${label}`, result.tree !== null && result.tree !== undefined)
+  // The bundle picks one name at load. Assert it picked the highest-preference
+  // one this host publishes, and that an unknown host falls back to the glyph.
+  const usedFallback = JSON.stringify(result.tree ?? null).includes('M4 6.5 8 10.5 12 6.5')
+  if (expected === null) {
+    check(`the inline glyph is the fallback under ${label}`, usedFallback, `picked=${JSON.stringify(picked)}`)
+  } else {
+    check(`the Plugins tab resolves the chevron under ${label}`, picked.includes(expected), `expected=${expected} picked=${JSON.stringify(picked)}`)
+  }
+  // The fallback is an inline <svg>; `undefined` as an element type is the
+  // crash this guards against, and JSON keeps it out of the tree entirely.
+  check(`no undefined element type leaks under ${label}`, !JSON.stringify(result.tree ?? null).includes('"type":null'), JSON.stringify(result.tree ?? null).slice(0, 120))
 }
 
 // ── the registration face is live, not a snapshot ───────────────────────────
 
-const sectionRegistration = registrations.find((registration) => registration.options.name === 'settings.section')
-const firstFace = propsFor(sectionRegistration)
+const faceRegistration = registrations.find((registration) => registration.options.name === 'settings.plugins.tab')
+const firstFace = propsFor(faceRegistration)
 check('the injected face exposes the store hook', typeof firstFace.useClinePass === 'function')
 const snapshotA = firstFace.useClinePass((value) => value)
 check('the store starts in a loading state', snapshotA.status === 'loading', JSON.stringify(snapshotA).slice(0, 80))
 check('the store is uSES-safe (same reference between reads)', firstFace.useClinePass((value) => value) === snapshotA)
 
+// Every action the face advertises must exist on the controller. The face is
+// built from `controller.<name>` references, so a method deleted from the
+// controller while its reference stays behind yields `undefined` here — and the
+// panel calls several of them from an effect, after paint, where nothing catches
+// the throw and the whole panel goes blank.
+{
+  const savedFetch = globalThis.fetch
+  globalThis.fetch = async () => ({ ok: true, async json() { return { ok: true, value: {} } } })
+  const advertised = Object.entries(firstFace).filter(([, value]) => typeof value === 'function' && value !== firstFace.useClinePass)
+  const missing = advertised.filter(([, value]) => value === undefined).map(([name]) => name)
+  check('every advertised action is a real function', missing.length === 0, `undefined: ${missing.join(', ')}`)
+  // Call each one: a method that exists but reaches for something absent throws
+  // just as loudly, and that is exactly what the panel's own effects do.
+  const args = {
+    setKey: ['CLINE_PASS_API_KEY', 'sk_typed'], testKey: ['CLINE_PASS_API_KEY', 'sk_typed'],
+    saveAndTest: ['CLINE_PASS_API_KEY', 'sk_typed'], addAccount: [{ name: 'a', key: 'sk_k' }],
+    removeAccount: ['a'], setAccountMode: [{ mode: 'single' }], setAccountEnabled: ['a', true],
+    pinModel: [{ model: 'm', upstreams: [], exclude: [], sort: 'none' }], setModelVisible: ['m', true],
+    setModelsVisibility: ['all'], probeModel: ['m'], validateModel: ['m'], testModel: ['m'],
+    resetModel: ['m'], loadHistory: [5], loadUsage: [true],
+  }
+  const thrown = []
+  for (const [name, fn] of advertised) {
+    try { await fn(...(args[name] ?? [])) } catch (error) { thrown.push(`${name}: ${error?.message ?? error}`) }
+  }
+  check('every advertised action is callable', thrown.length === 0, thrown.join(' | '))
+  globalThis.fetch = savedFetch
+}
+
+// The delete button is gated on `declared`, not on the pool size: an implicit
+// account is the top-level key with nothing to delete, while a materialized one
+// must stay removable even when it is the only account. Gating on the pool size
+// left the button permanently dead for the common single-account case.
+{
+  const savedFetch = globalThis.fetch
+  const seeded = (declared) => {
+    globalThis.fetch = async () => ({
+      ok: true,
+      async json() {
+        return {
+          ok: true,
+          value: {
+            provider: 'cline-pass', displayName: 'Cline Pass', baseURL: 'https://api.cline.bot/api/v1',
+            settingsAvailable: true, accountMode: 'single', activeAccount: '', ready: true,
+            accounts: [{ key: 'default', displayName: 'Cline Pass', apiKeyEnv: 'CLINE_PASS_API_KEY', enabled: true, declared, keyConfigured: true, keyHint: 'sk_liv…3456' }],
+            models: [], pinnedModels: 0, hiddenModels: 0, catalogCount: 0, historySize: 0, usage: null,
+          },
+        }
+      },
+    })
+  }
+  const removeButton = async (declared) => {
+    seeded(declared)
+    await firstFace.refresh()
+    const tree = runComponent(faceRegistration.component, firstFace).tree
+    const expanded = resolveComponents(tree)
+    const buttons = findButtons(expanded, '删除')
+    return buttons.find((button) => button.props.disabled !== undefined)
+  }
+  const implicit = await removeButton(false)
+  const materialized = await removeButton(true)
+  check('the delete button is disabled for an implicit account', implicit?.props.disabled === true, JSON.stringify(implicit?.props.disabled))
+  check('the delete button is enabled for a declared account', materialized?.props.disabled === false, JSON.stringify(materialized?.props.disabled))
+  globalThis.fetch = savedFetch
+  await firstFace.refresh()
+}
+
 // The actions the panel exposes must all be callable; each one is what a
 // button in the rendered tree binds to.
-for (const name of ['refresh', 'setKey', 'testKey', 'saveAndTest', 'addAccount', 'removeAccount', 'setAccountMode', 'pinModel', 'setupModel', 'probeModel', 'validateModel', 'testModel', 'resetModel', 'refreshModels', 'loadHistory']) {
+for (const name of ['refresh', 'setKey', 'testKey', 'saveAndTest', 'addAccount', 'removeAccount', 'setAccountMode', 'setAccountEnabled', 'pinModel', 'setModelVisible', 'setModelsVisibility', 'probeModel', 'validateModel', 'testModel', 'resetModel', 'refreshModels', 'loadUsage', 'loadHistory']) {
   check(`the injected face exposes ${name}`, typeof firstFace[name] === 'function')
 }
 
@@ -379,105 +708,6 @@ check('the browser half no longer speaks the old RPC channel', !source.includes(
 // A caller on the Models page gets the same controller as the Settings page,
 // so the two can never disagree about what is configured.
 check('one controller serves every registration', new Set(registrations.map((registration) => registration.options.inject)).size <= registrations.length)
-
-// ── the history fold reads on open, and says so ─────────────────────────────
-// The rows live on the host, so nothing but an explicit read can ever put them
-// on screen. Reporting the empty state before that read is what made a
-// hundred-row history look permanently blank.
-
-const panelCalls = []
-const previousFetch = globalThis.fetch
-globalThis.fetch = async (url, init) => {
-  const body = JSON.parse(String(init?.body ?? '{}'))
-  panelCalls.push({ url: String(url), endpoint: String(body.endpoint), payload: body.payload })
-  const value = body.endpoint === 'history'
-    ? { total: 2, entries: [{ ts: 1, model: 'cline-pass/glm-5.2', provider: 'alibaba', account: 'backup-2', ms: 42, stream: true, error: '' }] }
-    : {}
-  return { ok: true, status: 200, json: async () => ({ ok: true, value }) }
-}
-
-/** One model row as the panel projects it, with nothing pinned yet. */
-const modelRow = (id) => ({
-  id, displayName: id.replace(/^cline-pass\//, ''), pipeline: '', pinnable: true,
-  pinMode: 'strict', sort: '', pinned: [], excluded: [], upstreams: [], upstreamStatus: [],
-  lastProvider: '', lastMs: 0, probedAt: 0, validatedAt: 0,
-})
-
-try {
-  const section = registrations.find((registration) => registration.options.name === 'settings.section')
-  const props = propsFor(section)
-  const store = props.hooks.clinePass
-  store.set({
-    ...store.getSnapshot(),
-    status: 'ready',
-    data: {
-      provider: 'cline-pass', displayName: 'Cline Pass', baseURL: 'https://api.cline.bot/api/v1',
-      settingsAvailable: true, accountMode: 'single', activeAccount: '', ready: true,
-      accounts: [{ key: 'default', displayName: 'Cline Pass', apiKeyEnv: 'CLINE_PASS_API_KEY', enabled: true, keyConfigured: true, keyHint: 'sk_liv…3456' }],
-      models: [modelRow('cline-pass/glm-5.2'), modelRow('cline-pass/kimi-k3')],
-      pinnedModels: 0, catalogCount: 0, historySize: 2,
-    },
-  })
-
-  const before = runComponent(section.component, props)
-  const beforeText = collectRenderedText(before.tree).join(' ')
-  check('a closed history fold still reports how much was recorded', beforeText.includes('2 条'), beforeText.slice(0, 200))
-  check('an unread history says it is unread instead of empty', beforeText.includes('处理中…') && !beforeText.includes('暂无记录。'), beforeText.slice(-200))
-
-  const details = findNode(before.tree, (node) => node.tag === 'details')
-  check('the history fold is a details element with a toggle handler', typeof details?.props?.onToggle === 'function')
-
-  // Mounting the panel is the first read: the rows have to be there whether or
-  // not the fold is ever opened.
-  const tick = () => new Promise((resolve) => setTimeout(resolve, 0))
-  for (const effect of before.effects) effect()
-  await tick()
-  check('mounting the panel reads the history once', panelCalls.filter((entry) => entry.endpoint === 'history').length === 1, JSON.stringify(panelCalls))
-
-  const afterMount = runComponent(section.component, props)
-  const mountedText = collectRenderedText(afterMount.tree).join(' ')
-  check('the rows the host returned are rendered into the fold', mountedText.includes('cline-pass/glm-5.2') && mountedText.includes('alibaba') && mountedText.includes('42ms'), mountedText.slice(-260))
-  check('each row names the account that served it', mountedText.includes('backup-2'), mountedText.slice(-260))
-
-  if (typeof details?.props?.onToggle !== 'function') {
-    failures.push('the history fold cannot be reopened: no toggle handler to drive')
-  } else {
-    details.props.onToggle({ currentTarget: { open: true } })
-    await tick()
-    check('reopening the fold reads again', panelCalls.filter((entry) => entry.endpoint === 'history').length === 2, JSON.stringify(panelCalls))
-
-    details.props.onToggle({ currentTarget: { open: false } })
-    await tick()
-    check('closing the fold asks for nothing', panelCalls.filter((entry) => entry.endpoint === 'history').length === 2, JSON.stringify(panelCalls))
-  }
-
-  // ── the model list folds away ─────────────────────────────────────────────
-  const listText = collectRenderedText(afterMount.tree).join(' ')
-  check('the model list starts expanded', listText.includes('cline-pass/kimi-k3'), listText.slice(0, 200))
-
-  const fold = findNode(afterMount.tree, (node) => node.tag === 'button' && node.props['aria-expanded'] !== undefined)
-  check('the model list carries a fold control', fold !== undefined && fold.props['aria-expanded'] === true, JSON.stringify(fold?.props?.['aria-expanded']))
-
-  if (fold === undefined) {
-    failures.push('the model list cannot be folded: no control to drive')
-  } else {
-    fold.props.onClick()
-    const folded = runComponent(section.component, props)
-    const foldedText = collectRenderedText(folded.tree).join(' ')
-    // The history rows name models too, so the fold is proven by the one model
-    // only the list carries and by the per-row action that disappears with it.
-    check('folding the list hides every model row', !foldedText.includes('cline-pass/kimi-k3') && !foldedText.includes('一键配置'), foldedText.slice(0, 240))
-    check('the folded list still says how many models the route serves', foldedText.includes('2 个模型'), foldedText.slice(0, 240))
-    const reopen = findNode(folded.tree, (node) => node.tag === 'button' && node.props['aria-expanded'] !== undefined)
-    check('the fold control flips to reopening', reopen?.props?.['aria-expanded'] === false, JSON.stringify(reopen?.props?.['aria-expanded']))
-    reopen.props.onClick()
-    const expanded = runComponent(section.component, props)
-    check('reopening the list brings the rows back', collectRenderedText(expanded.tree).join(' ').includes('cline-pass/kimi-k3'))
-  }
-} finally {
-  if (previousFetch === undefined) delete globalThis.fetch
-  else globalThis.fetch = previousFetch
-}
 
 if (failures.length > 0) {
   console.error(`\n✘ ${failures.length} check(s) failed, ${passed} passed:\n`)
