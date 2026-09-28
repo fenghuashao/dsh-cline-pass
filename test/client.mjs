@@ -401,29 +401,64 @@ check('a composition without the locale service still renders Chinese', renderCa
   check('the loaded panel leaks no raw key', loaded !== null && !/keyMissing$|\bdata\b:/.test(loaded), (loaded ?? '').slice(0, 200))
 
   // The management-tools switch: a real checkbox, reflecting the stored value
-  // and wired to the host action. The value only takes effect on restart, which
-  // the host reports and the panel relays, so the control is honest about it.
+  // and wired to the host action. Its caption is the whole explanation the panel
+  // gives, so the caption has to carry the restart it needs — the value is read
+  // when the plugin activates, and nothing here can change that.
   {
-    const findCheckbox = (node, label, found = []) => {
-      if (node === null || node === undefined || typeof node !== 'object') return found
-      if (Array.isArray(node)) { node.forEach((child) => findCheckbox(child, label, found)); return found }
-      if (typeof node.type === 'function') return findCheckbox(node.type(node.props), label, found)
-      if (node.type === 'input' && node.props?.type === 'checkbox' && node.props?.['aria-label'] === label) found.push(node)
-      findCheckbox(node.props?.children, label, found)
-      return found
+    const collect = (node, out = { labels: [], boxes: [] }) => {
+      if (node === null || node === undefined || typeof node !== 'object') return out
+      if (Array.isArray(node)) { node.forEach((child) => collect(child, out)); return out }
+      if (typeof node.type === 'function') return collect(node.type(node.props), out)
+      if (node.type === 'input' && node.props?.type === 'checkbox') out.boxes.push(node)
+      if (node.type === 'label') out.labels.push(node)
+      collect(node.props?.children, out)
+      return out
     }
-    const label = '注册 cline_pass_* 工具'
     const surface = cardRegistrationForText.options.inject().hooks.clinePass
     const base = surface.getSnapshot()
-    const renderSwitch = () => findCheckbox(resolveComponents(runComponent(cardRegistrationForText.component, propsFor(cardRegistrationForText)).tree), label)
+    const renderSwitch = () => {
+      const out = collect(resolveComponents(runComponent(cardRegistrationForText.component, propsFor(cardRegistrationForText)).tree))
+      const label = out.labels.find((node) => JSON.stringify(node.props?.children ?? '').includes('开启工具注入'))
+      const box = label?.props?.children?.find?.((child) => child?.type === 'input') ?? out.boxes.at(-1)
+      return { label, box }
+    }
     surface.set({ ...base, status: 'ready', data: { ...base.data, exposeTools: false } })
     const off = renderSwitch()
-    check('the panel offers the management-tools switch', off.length === 1, String(off.length))
-    check('the switch is off when the tools are not registered', off[0]?.props.checked === false, JSON.stringify(off[0]?.props.checked))
-    check('the switch is wired to the host action', typeof off[0]?.props.onChange === 'function')
+    check('the panel offers the management-tools switch', off.box !== undefined, String(off.box))
+    check('the switch is off when the tools are not registered', off.box?.props.checked === false, JSON.stringify(off.box?.props.checked))
+    check('the switch is wired to the host action', typeof off.box?.props.onChange === 'function')
+    check('the caption carries the restart it needs', JSON.stringify(off.label?.props?.children ?? '').includes('重启后生效'), JSON.stringify(off.label?.props?.children ?? null))
+    // The caption is the whole explanation the panel gives, so it is also the
+    // place a stray third line would reappear. Pin the exact wording and the
+    // absence of the removed metadata lines.
+    const captionText = (node) => {
+      if (typeof node === 'string') return node
+      if (node === null || node === undefined || typeof node !== 'object') return ''
+      if (Array.isArray(node)) return node.map(captionText).join('')
+      if (typeof node.type === 'function') return captionText(node.type(node.props))
+      return captionText(node.props?.children)
+    }
+    check('the caption is exactly the requested wording',
+      captionText(off.label) === '开启工具注入（重启后生效）',
+      JSON.stringify(captionText(off.label)))
+    {
+      const rendered = resolveComponents(runComponent(cardRegistrationForText.component, propsFor(cardRegistrationForText)).tree)
+      const strings = []
+      const collectStrings = (node) => {
+        if (typeof node === 'string') { strings.push(node); return }
+        if (node === null || node === undefined || typeof node !== 'object') return
+        if (Array.isArray(node)) { node.forEach(collectStrings); return }
+        if (typeof node.type === 'function') { collectStrings(node.type(node.props)); return }
+        collectStrings(node.props?.children)
+      }
+      collectStrings(rendered)
+      check('no leftover management-tools metadata is rendered',
+        !strings.some((text) => /5\.5k|管理工具|exposeTools|未注册/.test(text)),
+        strings.filter((text) => /5\.5k|管理工具|exposeTools|未注册/.test(text)).join(' | '))
+    }
     surface.set({ ...base, status: 'ready', data: { ...base.data, exposeTools: true } })
     const on = renderSwitch()
-    check('the switch is on when the tools are registered', on[0]?.props.checked === true, JSON.stringify(on[0]?.props.checked))
+    check('the switch is on when the tools are registered', on.box?.props.checked === true, JSON.stringify(on.box?.props.checked))
     surface.set(base)
   }  store.set(snapshot)
 }

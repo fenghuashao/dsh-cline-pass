@@ -72,7 +72,7 @@ cline_pass_accounts action=mode mode=roundrobin
 
 `cline_pass_*` 工具**默认不注册**。8 个工具定义合计约 5.5k 字符，会出现在每次请求的工具列表里，而管理路由只是偶尔需要，所以默认让所有对话都不必付这份开销。
 
-需要时在**设置 → Cline Pass** 中勾选「注册 cline_pass_* 工具」，或在 profile 配置里打开：
+需要时在**设置 → Cline Pass** 中勾选「开启工具注入（重启后生效）」，或在 profile 配置里打开：
 
 ```yaml
 - id: cline-pass
@@ -80,9 +80,9 @@ cline_pass_accounts action=mode mode=roundrobin
     exposeTools: true
 ```
 
-**该值在插件激活时读取，改动后需重启 dsh 才生效** —— 已经注册的工具无法从进行中的对话里撤回。面板保存后会提示需要重启。
+**该值在插件激活时读取，改动后需重启 dsh 才生效** —— 已经注册的工具无法从进行中的对话里撤回。
 
-提供商路由和设置面板不受影响 —— 面板是浏览器页面而非工具，工具关闭时仍然可用（面板会提示工具已关闭）。
+提供商路由和设置面板不受影响 —— 面板是浏览器页面而非工具，工具关闭时仍然可用。
 
 > 从 0.2.1 及更早版本升级的 profile 里没有 `exposeTools` 键，因此会采用新的默认值 `false`：升级后 `cline_pass_*` 工具将不再注册。面板会提示，勾选该复选框并在重启后恢复。
 

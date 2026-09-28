@@ -74,7 +74,7 @@ Common settings include `baseURL`, `knownModels`, `models`, `perModel`, `exposeT
 
 The `cline_pass_*` tools are **not registered by default**. Their eight definitions total roughly 5.5k characters of schema and description that ride in every request's tool list, and managing the route is an occasional need, so the default keeps that cost out of every conversation.
 
-Turn them on in **Settings → Cline Pass**, or in the profile configuration:
+Turn them on with **Expose the tools (takes effect after a restart)** in **Settings → Cline Pass**, or in the profile configuration:
 
 ```yaml
 - id: cline-pass
@@ -82,9 +82,9 @@ Turn them on in **Settings → Cline Pass**, or in the profile configuration:
     exposeTools: true
 ```
 
-**The value is read when the plugin activates, so a change needs a dsh restart** — a tool already registered cannot be pulled back out of a conversation in progress. The panel says so after saving.
+**The value is read when the plugin activates, so a change needs a dsh restart** — a tool already registered cannot be pulled back out of a conversation in progress.
 
-The provider route and the setup panel are unaffected — the panel is a browser page rather than a tool, and it stays available with the tools off (it reports that they are off).
+The provider route and the setup panel are unaffected — the panel is a browser page rather than a tool, and it stays available with the tools off.
 
 > A profile upgraded from 0.2.1 or earlier has no `exposeTools` key, so it adopts the new default of `false` and its `cline_pass_*` tools stop being registered. The panel reports this; tick the checkbox and restart to bring them back.
 
