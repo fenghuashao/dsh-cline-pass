@@ -13,7 +13,7 @@
 
 ## 要求
 
-- dsh `>= 0.1.2-alpha.3`
+- dsh `>= 0.1.2-alpha.3 < 0.3.0`
 - Node.js `>= 20.3`
 - Cline Pass API Key
 

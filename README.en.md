@@ -13,7 +13,7 @@ Connect [Cline Pass](https://cline.bot/cline-pass) subscription models to the [D
 
 ## Requirements
 
-- dsh `>= 0.1.2-alpha.3 < 0.2.0`
+- dsh `>= 0.1.2-alpha.3 < 0.3.0`
 - Node.js `>= 20.3`
 - A Cline Pass API key
 
