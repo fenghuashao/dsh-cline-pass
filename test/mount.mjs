@@ -106,6 +106,9 @@ writeFileSync(join(profileDir, 'cordis.patch.yml'), `# Config overrides for the 
     knownModels:
       - cline-pass/glm-5.2
       - cline-pass/kimi-k3
+    # This harness drives the tools, which are off by default, so it asks for
+    # them the way a user would.
+    exposeTools: true
 ${hasSettingsFile ? '' : `    accounts: {}
     accountMode: single
     activeAccount: ""
@@ -351,6 +354,10 @@ try {
   const stateResponse = await panelPost(envelope('state'), cookie)
   check('the panel answers state over real HTTP', stateResponse.status === 200 && stateResponse.json?.ok === true, `HTTP ${stateResponse.status} — ${stateResponse.text.slice(0, 120)}`)
   check('the panel state names the mounted route', stateResponse.json?.value?.provider === 'cline-pass', JSON.stringify(stateResponse.json?.value?.provider))
+  // The tools posture travels with every reading, so the panel can show a switch
+  // and a restart notice that agree with what the host actually registered. This
+  // harness asked for them on, and the tools above are only reachable that way.
+  check('the panel reports the tools posture it mounted under', stateResponse.json?.value?.exposeTools === true, JSON.stringify(stateResponse.json?.value?.exposeTools))
   check('the panel state confirms the configured key', stateResponse.json?.value?.ready === true, JSON.stringify(stateResponse.json?.value?.ready))
 
   const pinResponse = await panelPost(envelope('model.pin', { model: 'cline-pass/kimi-k3', upstreams: ['gmicloud'], pinMode: 'preferred', sort: 'ttft' }), cookie)

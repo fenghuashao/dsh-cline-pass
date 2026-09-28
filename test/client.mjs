@@ -399,7 +399,33 @@ check('a composition without the locale service still renders Chinese', renderCa
   check('the loaded panel names an unknown window verbatim', loaded !== null && loaded.includes('made_up_window'), (loaded ?? '').slice(0, 300))
   check('the loaded panel shows the pinned channel', loaded !== null && loaded.includes('alibaba'), (loaded ?? '').slice(0, 300))
   check('the loaded panel leaks no raw key', loaded !== null && !/keyMissing$|\bdata\b:/.test(loaded), (loaded ?? '').slice(0, 200))
-  store.set(snapshot)
+
+  // The management-tools switch: a real checkbox, reflecting the stored value
+  // and wired to the host action. The value only takes effect on restart, which
+  // the host reports and the panel relays, so the control is honest about it.
+  {
+    const findCheckbox = (node, label, found = []) => {
+      if (node === null || node === undefined || typeof node !== 'object') return found
+      if (Array.isArray(node)) { node.forEach((child) => findCheckbox(child, label, found)); return found }
+      if (typeof node.type === 'function') return findCheckbox(node.type(node.props), label, found)
+      if (node.type === 'input' && node.props?.type === 'checkbox' && node.props?.['aria-label'] === label) found.push(node)
+      findCheckbox(node.props?.children, label, found)
+      return found
+    }
+    const label = '注册 cline_pass_* 工具'
+    const surface = cardRegistrationForText.options.inject().hooks.clinePass
+    const base = surface.getSnapshot()
+    const renderSwitch = () => findCheckbox(resolveComponents(runComponent(cardRegistrationForText.component, propsFor(cardRegistrationForText)).tree), label)
+    surface.set({ ...base, status: 'ready', data: { ...base.data, exposeTools: false } })
+    const off = renderSwitch()
+    check('the panel offers the management-tools switch', off.length === 1, String(off.length))
+    check('the switch is off when the tools are not registered', off[0]?.props.checked === false, JSON.stringify(off[0]?.props.checked))
+    check('the switch is wired to the host action', typeof off[0]?.props.onChange === 'function')
+    surface.set({ ...base, status: 'ready', data: { ...base.data, exposeTools: true } })
+    const on = renderSwitch()
+    check('the switch is on when the tools are registered', on[0]?.props.checked === true, JSON.stringify(on[0]?.props.checked))
+    surface.set(base)
+  }  store.set(snapshot)
 }
 
 // ── the user's path: open the tab, let the effects run, show the data ───────

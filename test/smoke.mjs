@@ -864,17 +864,20 @@ try {
       return seen.tools.length
     }
 
-    const withTools = isolated(true)
-    check('the management tools are registered by default', withTools === 8, String(withTools))
-    check('the provider route is registered regardless of exposeTools', seen.adapters.includes('cline-pass'), seen.adapters.join(','))
+    // Off by default: the cost of the definitions is paid by every
+    // conversation, while the tools are wanted by the few that manage the route.
+    check('the management tools are off by default', Config({}).exposeTools === false, String(Config({}).exposeTools))
+    check('the option accepts an explicit on', Config({ exposeTools: true }).exposeTools === true)
 
-    seen.tools.length = 0
     const withoutTools = isolated(false)
     check('exposeTools: false registers no cline_pass_* tool', withoutTools === 0, String(withoutTools))
     check('exposeTools: false still registers the provider route', seen.adapters.includes('cline-pass'), seen.adapters.join(','))
     check('exposeTools: false still publishes the panel route', seen.routes > 0, String(seen.routes))
-    check('the option defaults to on', Config({}).exposeTools === true, String(Config({}).exposeTools))
-    check('the option accepts an explicit off', Config({ exposeTools: false }).exposeTools === false)
+
+    seen.tools.length = 0
+    const withTools = isolated(true)
+    check('exposeTools: true registers all eight tools', withTools === 8, String(withTools))
+    check('exposeTools: true keeps the provider route', seen.adapters.includes('cline-pass'), seen.adapters.join(','))
   }
 
   // The panel drives the same engine and control surface the tools use, so it
