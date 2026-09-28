@@ -866,8 +866,11 @@ try {
 
     // Off by default: the cost of the definitions is paid by every
     // conversation, while the tools are wanted by the few that manage the route.
-    check('the management tools are off by default', Config({}).exposeTools === false, String(Config({}).exposeTools))
-    check('the option accepts an explicit on', Config({ exposeTools: true }).exposeTools === true)
+    // The schema marks the field volatile, so a parsed value is a reference
+    // object on this host; unwrap it the way `apply()` does.
+    const valueOf = (field) => (field !== null && typeof field === 'object' && typeof field.get === 'function' ? field.get() : field)
+    check('the management tools are off by default', valueOf(Config({}).exposeTools) === false, JSON.stringify(valueOf(Config({}).exposeTools)))
+    check('the option accepts an explicit on', valueOf(Config({ exposeTools: true }).exposeTools) === true)
 
     const withoutTools = isolated(false)
     check('exposeTools: false registers no cline_pass_* tool', withoutTools === 0, String(withoutTools))
@@ -878,6 +881,24 @@ try {
     const withTools = isolated(true)
     check('exposeTools: true registers all eight tools', withTools === 8, String(withTools))
     check('exposeTools: true keeps the provider route', seen.adapters.includes('cline-pass'), seen.adapters.join(','))
+
+    // The field is volatile, so on a supporting host the Loader may hand it over
+    // as a reference object rather than a value. Reading `config.exposeTools`
+    // directly would then be reading a ref, and `ref !== false` is true even for
+    // a stored `false` — the exact bug that made the switch fail to take.
+    const asRefCount = (value) => {
+      const local = { ...fakeCtx, tools: { register: () => () => {} }, llm: fakeCtx.llm }
+      apply(local, { ...section, exposeTools: { get: () => value } })
+      return registered
+    }
+    let registered = 0
+    const refTools = { ...fakeCtx }
+    refTools.tools = { register: () => { registered += 1; return () => {} } }
+    apply(refTools, { ...section, exposeTools: { get: () => true } })
+    check('a live reference reading true registers the tools', registered === 8, String(registered))
+    registered = 0
+    apply(refTools, { ...section, exposeTools: { get: () => false } })
+    check('a live reference reading false registers none', registered === 0, String(registered))
   }
 
   // The panel drives the same engine and control surface the tools use, so it
@@ -904,9 +925,6 @@ try {
     readCredential: async (ref) => credentials.get(String(ref)) ?? '',
     setCredential: async (ref, value) => { credentials.set(String(ref), String(value)) },
     refreshCatalog: async () => ({ added: [], models: section.knownModels, sources: ['test'] }),
-    // The panel reports whether the management tools are registered. It is read
-    // at activation, so it is a method rather than a config field.
-    exposeTools: () => true,
   }
   const panelEngine = createEngine({
     resolveAccount: async () => ({ name: 'default', key: credentials.get('CLINE_PASS_API_KEY'), baseURL }),

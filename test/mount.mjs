@@ -372,6 +372,31 @@ try {
   const writtenPerModel = documents.some((text) => /perModel:/.test(text) && /gmicloud/.test(text))
   check('a panel write reaches the settings document', pinResponse.status === 200 && writtenPerModel, `${pinResponse.status} — ${documents.map((text) => text.slice(0, 160)).join(' | ')}`)
 
+  // The tools switch writes a field the panel did not previously touch, and a
+  // write to a field the schema does not mark volatile is refused outright —
+  // `Config field "exposeTools" is not volatile`. Only a real settings service
+  // enforces that, so this cannot be covered by a stub: it has to go through the
+  // mounted document, which is what a browser click does.
+  const exposeResponse = await panelPost(envelope('tools.expose', { value: false }), cookie)
+  check('the tools switch writes through the real settings service',
+    exposeResponse.status === 200 && exposeResponse.json?.ok === true,
+    `HTTP ${exposeResponse.status} — ${exposeResponse.text.slice(0, 300)}`)
+  const afterWrite = [
+    join(scratch, 'settings.yaml'),
+    join(profileDir, 'cordis.patch.yml'),
+  ].filter((path) => existsSync(path)).map((path) => readFileSync(path, 'utf8'))
+  check('the tools switch reaches the settings document',
+    afterWrite.some((text) => /exposeTools:\s*false/.test(text)),
+    afterWrite.map((text) => text.slice(0, 200)).join(' | '))
+  // And the switch keeps showing what was chosen. Reporting the value the
+  // *running* plugin was built with instead would flip it straight back to
+  // `true` here, so this is the check that the control does not lie about a
+  // click that in fact succeeded.
+  const afterState = await panelPost(envelope('state'), cookie)
+  check('the switch keeps the choice it was just given',
+    afterState.json?.value?.exposeTools === false,
+    JSON.stringify(afterState.json?.value?.exposeTools))
+
   // ── removing an account actually removes it ───────────────────────────────
   //
   // Adding a second account and then deleting it is the only way to see whether
