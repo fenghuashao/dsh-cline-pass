@@ -834,6 +834,49 @@ try {
   apply(fakeCtx, { ...section })
   await new Promise((resolve) => setTimeout(resolve, 10))
 
+  // ── exposeTools: the management surface is optional ───────────────────────
+  //
+  // The eight definitions are ~5.5k characters of tool list on every request,
+  // and a conversation that never probes, pins or edits the pool does not need
+  // them. Turning them off must not cost the provider route or the setup panel:
+  // the panel is a browser page, not a tool, so it has to keep working — and a
+  // reader who came there expecting the tools should be told why they are gone.
+  {
+    const seen = { adapters: [], tools: [], slots: 0, routes: 0 }
+    const isolated = (exposeTools) => {
+      const local = {
+        ...fakeCtx,
+        llm: {
+          ...fakeCtx.llm,
+          registerAdapter: (providers) => { seen.adapters.push(...providers) },
+        },
+        tools: { register: (definition) => { seen.tools.push(definition.name); return () => {} } },
+        connection: { fetch: { register: () => { seen.routes += 1; return { dispose() {} } } } },
+        get(name) { return name === 'connection' ? this.connection : fakeCtx.get.call(this, name) },
+        // `fakeCtx.inject` answers settings and credentials only, so the panel's
+        // own `inject(['connection'], …)` has to be served here.
+        inject(names, callback) {
+          if (names.includes('connection')) callback(this)
+          fakeCtx.inject.call(this, names, callback)
+        },
+      }
+      apply(local, { ...section, exposeTools })
+      return seen.tools.length
+    }
+
+    const withTools = isolated(true)
+    check('the management tools are registered by default', withTools === 8, String(withTools))
+    check('the provider route is registered regardless of exposeTools', seen.adapters.includes('cline-pass'), seen.adapters.join(','))
+
+    seen.tools.length = 0
+    const withoutTools = isolated(false)
+    check('exposeTools: false registers no cline_pass_* tool', withoutTools === 0, String(withoutTools))
+    check('exposeTools: false still registers the provider route', seen.adapters.includes('cline-pass'), seen.adapters.join(','))
+    check('exposeTools: false still publishes the panel route', seen.routes > 0, String(seen.routes))
+    check('the option defaults to on', Config({}).exposeTools === true, String(Config({}).exposeTools))
+    check('the option accepts an explicit off', Config({ exposeTools: false }).exposeTools === false)
+  }
+
   // The panel drives the same engine and control surface the tools use, so it
   // is exercised against the live section and credential map the tools wrote.
   const panelControl = {
@@ -858,6 +901,9 @@ try {
     readCredential: async (ref) => credentials.get(String(ref)) ?? '',
     setCredential: async (ref, value) => { credentials.set(String(ref), String(value)) },
     refreshCatalog: async () => ({ added: [], models: section.knownModels, sources: ['test'] }),
+    // The panel reports whether the management tools are registered. It is read
+    // at activation, so it is a method rather than a config field.
+    exposeTools: () => true,
   }
   const panelEngine = createEngine({
     resolveAccount: async () => ({ name: 'default', key: credentials.get('CLINE_PASS_API_KEY'), baseURL }),

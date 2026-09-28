@@ -68,7 +68,19 @@ To override defaults, add a `cline-pass` section to your profile's `$DSH_HOME/pr
         apiKeyEnv: CLINE_PASS_BACKUP_KEY
 ```
 
-Common settings include `baseURL`, `knownModels`, `models`, `perModel`, `exposeCatalog`, and `historyLimit`. The default gateway is `https://api.cline.bot/api/v1`. `maxConcurrentRequests` caps how many streams each account keeps open to the gateway at once (default 16); further requests wait for a free slot, and `0` lifts the cap.
+Common settings include `baseURL`, `knownModels`, `models`, `perModel`, `exposeTools`, `exposeCatalog`, and `historyLimit`. The default gateway is `https://api.cline.bot/api/v1`. `maxConcurrentRequests` caps how many streams each account keeps open to the gateway at once (default 16); further requests wait for a free slot, and `0` lifts the cap.
+
+### Management tools
+
+The `cline_pass_*` tools are registered by default. Their eight definitions total roughly 5.5k characters of schema and description that ride in every request's tool list, so a conversation that never probes, pins, or edits the pool can turn them off:
+
+```yaml
+- id: cline-pass
+  config:
+    exposeTools: false
+```
+
+The provider route and the setup panel are unaffected — the panel is a browser page rather than a tool, and it stays available (it reports that the tools are off). The value is read when the plugin activates, so a change needs a reload.
 
 ## Upstream channels
 

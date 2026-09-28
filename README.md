@@ -68,6 +68,18 @@ cline_pass_accounts action=mode mode=roundrobin
         apiKeyEnv: CLINE_PASS_BACKUP_KEY
 ```
 
+### 管理工具
+
+`cline_pass_*` 工具默认注册。8 个工具定义合计约 5.5k 字符，会出现在每次请求的工具列表里；日常对话不需要探测、钉住或改账号池时，可以关掉：
+
+```yaml
+- id: cline-pass
+  config:
+    exposeTools: false
+```
+
+提供商路由和设置面板不受影响 —— 面板是浏览器页面而非工具，仍然可用（面板会提示工具已关闭）。该值在插件激活时读取，改动后需重载。
+
 常用设置包括 `baseURL`、`knownModels`、`models`、`perModel`、`exposeCatalog` 和 `historyLimit`。默认网关地址为 `https://api.cline.bot/api/v1`。`maxConcurrentRequests` 限制每个账号同时发往网关的流数，默认 16，超出的请求排队等待空位，设为 `0` 表示不限。
 
 ## 上游渠道
