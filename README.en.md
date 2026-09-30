@@ -13,7 +13,7 @@ Connect [Cline Pass](https://cline.bot/cline-pass) subscription models to the [D
 
 ## Requirements
 
-- dsh `>= 0.1.2-alpha.3 < 0.2.0`
+- dsh `>= 0.1.2-alpha.3 < 0.3.0`
 - Node.js `>= 20.3`
 - A Cline Pass API key
 
@@ -68,7 +68,25 @@ To override defaults, add a `cline-pass` section to your profile's `$DSH_HOME/pr
         apiKeyEnv: CLINE_PASS_BACKUP_KEY
 ```
 
-Common settings include `baseURL`, `knownModels`, `models`, `perModel`, `exposeCatalog`, and `historyLimit`. The default gateway is `https://api.cline.bot/api/v1`.
+Common settings include `baseURL`, `knownModels`, `models`, `perModel`, `exposeTools`, `exposeCatalog`, and `historyLimit`. The default gateway is `https://api.cline.bot/api/v1`. `maxConcurrentRequests` caps how many streams each account keeps open to the gateway at once (default 16); further requests wait for a free slot, and `0` lifts the cap.
+
+### Management tools
+
+The `cline_pass_*` tools are **not registered by default**. Their eight definitions total roughly 5.5k characters of schema and description that ride in every request's tool list, and managing the route is an occasional need, so the default keeps that cost out of every conversation.
+
+Turn them on with **Expose the tools (takes effect after a restart)** in **Settings → Cline Pass**, or in the profile configuration:
+
+```yaml
+- id: cline-pass
+  config:
+    exposeTools: true
+```
+
+**The value is read when the plugin activates, so a change needs a dsh restart** — a tool already registered cannot be pulled back out of a conversation in progress.
+
+The provider route and the setup panel are unaffected — the panel is a browser page rather than a tool, and it stays available with the tools off.
+
+> A profile upgraded from 0.2.1 or earlier has no `exposeTools` key, so it adopts the new default of `false` and its `cline_pass_*` tools stop being registered. The panel reports this; tick the checkbox and restart to bring them back.
 
 ## Upstream channels
 

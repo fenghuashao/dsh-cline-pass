@@ -106,6 +106,9 @@ writeFileSync(join(profileDir, 'cordis.patch.yml'), `# Config overrides for the 
     knownModels:
       - cline-pass/glm-5.2
       - cline-pass/kimi-k3
+    # This harness drives the tools, which are off by default, so it asks for
+    # them the way a user would.
+    exposeTools: true
 ${hasSettingsFile ? '' : `    accounts: {}
     accountMode: single
     activeAccount: ""
@@ -351,6 +354,10 @@ try {
   const stateResponse = await panelPost(envelope('state'), cookie)
   check('the panel answers state over real HTTP', stateResponse.status === 200 && stateResponse.json?.ok === true, `HTTP ${stateResponse.status} — ${stateResponse.text.slice(0, 120)}`)
   check('the panel state names the mounted route', stateResponse.json?.value?.provider === 'cline-pass', JSON.stringify(stateResponse.json?.value?.provider))
+  // The tools posture travels with every reading, so the panel can show a switch
+  // and a restart notice that agree with what the host actually registered. This
+  // harness asked for them on, and the tools above are only reachable that way.
+  check('the panel reports the tools posture it mounted under', stateResponse.json?.value?.exposeTools === true, JSON.stringify(stateResponse.json?.value?.exposeTools))
   check('the panel state confirms the configured key', stateResponse.json?.value?.ready === true, JSON.stringify(stateResponse.json?.value?.ready))
 
   const pinResponse = await panelPost(envelope('model.pin', { model: 'cline-pass/kimi-k3', upstreams: ['gmicloud'], pinMode: 'preferred', sort: 'ttft' }), cookie)
@@ -364,6 +371,31 @@ try {
   ].filter((path) => existsSync(path)).map((path) => readFileSync(path, 'utf8'))
   const writtenPerModel = documents.some((text) => /perModel:/.test(text) && /gmicloud/.test(text))
   check('a panel write reaches the settings document', pinResponse.status === 200 && writtenPerModel, `${pinResponse.status} — ${documents.map((text) => text.slice(0, 160)).join(' | ')}`)
+
+  // The tools switch writes a field the panel did not previously touch, and a
+  // write to a field the schema does not mark volatile is refused outright —
+  // `Config field "exposeTools" is not volatile`. Only a real settings service
+  // enforces that, so this cannot be covered by a stub: it has to go through the
+  // mounted document, which is what a browser click does.
+  const exposeResponse = await panelPost(envelope('tools.expose', { value: false }), cookie)
+  check('the tools switch writes through the real settings service',
+    exposeResponse.status === 200 && exposeResponse.json?.ok === true,
+    `HTTP ${exposeResponse.status} — ${exposeResponse.text.slice(0, 300)}`)
+  const afterWrite = [
+    join(scratch, 'settings.yaml'),
+    join(profileDir, 'cordis.patch.yml'),
+  ].filter((path) => existsSync(path)).map((path) => readFileSync(path, 'utf8'))
+  check('the tools switch reaches the settings document',
+    afterWrite.some((text) => /exposeTools:\s*false/.test(text)),
+    afterWrite.map((text) => text.slice(0, 200)).join(' | '))
+  // And the switch keeps showing what was chosen. Reporting the value the
+  // *running* plugin was built with instead would flip it straight back to
+  // `true` here, so this is the check that the control does not lie about a
+  // click that in fact succeeded.
+  const afterState = await panelPost(envelope('state'), cookie)
+  check('the switch keeps the choice it was just given',
+    afterState.json?.value?.exposeTools === false,
+    JSON.stringify(afterState.json?.value?.exposeTools))
 
   // ── removing an account actually removes it ───────────────────────────────
   //
