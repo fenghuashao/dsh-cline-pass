@@ -302,6 +302,12 @@ try {
   const clientRow = (graph?.entries ?? []).find((row) => row.id === 'dsh-cline-pass')
   check('the browser bundle is served from a revisioned URL', typeof clientRow?.url === 'string' && clientRow.url.includes('rev='), String(clientRow?.url))
   check('the browser bundle declares the plugins it waits for', Array.isArray(clientRow?.inject) && clientRow.inject.includes('@deepseek-ai/dsh-client-connection'), JSON.stringify(clientRow?.inject))
+  // The usage pill reads the selected provider from the model-selection service,
+  // so the bundle has to declare it. Without the declaration the service is
+  // gated and the pill's inject throws — which only shows up in the browser.
+  check('the browser bundle waits for the model-selection service',
+    Array.isArray(clientRow?.inject) && clientRow.inject.includes('@deepseek-ai/dsh-client-ui-model-selection'),
+    JSON.stringify(clientRow?.inject))
 
   // ── the panel route over real HTTP ────────────────────────────────────────
   // A rendered browser half proves nothing about the host route it calls: a

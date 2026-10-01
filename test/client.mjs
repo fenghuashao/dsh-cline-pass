@@ -75,10 +75,13 @@ function renderNode(node, depth = 0) {
  * captured so a test can assert it does not throw on its own). This is enough
  * to execute every branch a first render takes.
  */
-function runComponent(component, props) {
+function runComponent(component, props, persistent) {
   const effects = []
   let cursor = 0
-  const slots = []
+  // `persistent` carries hook state across renders, which is what a second render
+  // after an effect set state has to see. Without it every render starts blank and
+  // a component that fetches in an effect can never show its result.
+  const slots = persistent ?? []
   const React = {
     createElement,
     Fragment: Symbol('Fragment'),
@@ -91,6 +94,9 @@ function runComponent(component, props) {
     useMemo(factory) { cursor += 1; return factory() },
     useRef(initial) { cursor += 1; return { current: initial } },
     useCallback(callback) { cursor += 1; return callback },
+    // The pill subscribes to the model-selection store through this, so the
+    // stub has to read the snapshot rather than returning a constant.
+    useSyncExternalStore(subscribe, getSnapshot) { return getSnapshot() },
   }
   const tree = renderNode(component({ ...props, React }))
   return { tree, effects }
@@ -107,6 +113,12 @@ const documentStub = {
   head: { appendChild() {} },
   createElement: () => ({ dataset: {}, textContent: '', setAttribute() {} }),
   querySelector: () => null,
+  // The usage pill skips a poll in a hidden tab and refreshes when the tab comes
+  // back, so it registers and removes a visibility listener. A stub without
+  // these throws from an effect — after paint, outside any render assertion.
+  visibilityState: 'visible',
+  addEventListener() {},
+  removeEventListener() {},
 }
 
 const windowStub = {
@@ -152,6 +164,12 @@ const primitivesStub = {
 const collectedEffects = []
 
 function makeRequire(primitives = primitivesStub, react = undefined) {
+  // This table belongs to the caller that gets it back, so its hook state is its
+  // own. The blocks that render a component to completion pass their own table
+  // (with a cursor they can restart); this one only serves the registrations the
+  // module-scope `apply()` records, whose bodies are never rendered here.
+  const ownHooks = []
+  let ownCursor = 0
   const React = react ?? {
     createElement,
     Fragment: Symbol('Fragment'),
@@ -160,8 +178,12 @@ function makeRequire(primitives = primitivesStub, react = undefined) {
     // bodies are part of the rendered tree — a collapsed card renders its
     // header alone, and the copy asserted below lives in the body.
     useState: (initial) => {
-      const value = typeof initial === 'function' ? initial() : initial
-      return [value === false ? true : value, () => {}]
+      const index = ownCursor++
+      if (!(index in ownHooks)) {
+        const value = typeof initial === 'function' ? initial() : initial
+        ownHooks[index] = value === false ? true : value
+      }
+      return [ownHooks[index], (next) => { ownHooks[index] = typeof next === 'function' ? next(ownHooks[index]) : next }]
     },
     // Effects are where the panel reaches for its actions, and they run after
     // the first paint — outside every error boundary the render assertions
@@ -170,7 +192,12 @@ function makeRequire(primitives = primitivesStub, react = undefined) {
     // takes the whole panel down without failing any render assertion.
     useEffect: (callback) => { collectedEffects.push(callback) },
     useMemo: (factory) => factory(),
-    useRef: () => ({ current: undefined }),
+    useRef: (initial) => ({ current: initial }),
+    // The bundle reads `React.useSyncExternalStore` from this table (not from a
+    // prop), so the usage pill's subscription has to be served here. It reads the
+    // snapshot, which is what lets a test move the selection and re-render.
+    useSyncExternalStore: (subscribe, getSnapshot) => getSnapshot(),
+    useCallback: (callback) => callback,
   }
   return (specifier) => {
     if (specifier === 'react') return React
@@ -211,6 +238,21 @@ try {
 }
 
 check('the bundle requires nothing outside the platform seed', missingRequires.length === 0, missingRequires.join(','))
+
+// A duplicate key in a dictionary is silently the LAST one: the earlier value is
+// overwritten, so a new key that collides with an existing one breaks whatever
+// already used it, with nothing failing at load. This is how the usage pill's
+// heading broke the quota card's heading.
+{
+  // `source` is the bundle read at the top of this file.
+  for (const name of ['ZH', 'EN']) {
+    const from = source.indexOf(`const ${name} = {`)
+    const body = source.slice(from, source.indexOf('\n    }', from))
+    const keys = [...body.matchAll(/^\s*([a-zA-Z][A-Za-z0-9]*):/gm)].map((match) => match[1])
+    const duplicates = [...new Set(keys.filter((key, index) => keys.indexOf(key) !== index))]
+    check(`the ${name} dictionary declares no duplicate key`, duplicates.length === 0, duplicates.join(', '))
+  }
+}
 check('the plugin exports apply()', typeof exportsValue?.apply === 'function')
 check('the plugin declares its inject list', Array.isArray(exportsValue?.inject) && exportsValue.inject.length > 0, JSON.stringify(exportsValue?.inject))
 check('the plugin injects slots', exportsValue?.inject?.includes('slots'))
@@ -248,10 +290,27 @@ const connectionService = {
 // through `get()`; the plugin uses both forms. `stubLocale` stays reassignable
 // so the tests below can exercise each locale posture.
 let stubLocale
+/**
+ * The model-selection directory the usage pill reads the selected provider from.
+ *
+ * `session` is captured so a test can move the selection and assert the pill
+ * re-gates; a stub that answered `undefined` would let a pill that never reads
+ * the selection back pass.
+ */
+const stubDirectory = { current: { provider: 'cline-pass', model: 'cline-pass/glm-5.3' } }
+const stubModelDirectories = {
+  directoryFor: () => ({
+    store: {
+      getSnapshot: () => stubDirectory,
+      subscribe: () => () => {},
+    },
+  }),
+}
 const stubCtx = {
   logger: { info() {}, warn() {}, error() {} },
   slots: slotsService,
   connection: connectionService,
+  modelDirectories: stubModelDirectories,
   effect(body) {
     const dispose = body()
     return typeof dispose === 'function' ? dispose : () => {}
@@ -260,6 +319,7 @@ const stubCtx = {
     if (name === 'slots') return slotsService
     if (name === 'connection') return connectionService
     if (name === 'locale') return stubLocale
+    if (name === 'modelDirectories') return stubModelDirectories
     return undefined
   },
 }
@@ -273,7 +333,7 @@ try {
 check('apply() runs without throwing', applyError === null, applyError?.message ?? '')
 
 const keys = registrations.map((registration) => `${registration.options.name}:${registration.options.key ?? registration.options.id ?? ''}`)
-check('every declared slot is registered', registrations.length === 2, keys.join(' '))
+check('every declared slot is registered', registrations.length === 3, keys.join(' '))
 check('a Plugins tab is registered', registrations.some((registration) => registration.options.name === 'settings.plugins.tab' && registration.options.id === 'cline-pass'), keys.join(' '))
 check('a Models-page card is registered', registrations.some((registration) => registration.options.name === 'settings.models.provider-card' && registration.options.key === 'cline-pass'), keys.join(' '))
 // `settings.plugins.tab` is a list slot ordered by `order`; the host's own
@@ -527,9 +587,12 @@ check('a composition without the locale service still renders Chinese', renderCa
 // ── call every registered component ─────────────────────────────────────────
 
 /** Build the props a slot hands a component: the injected face plus hooks. */
-function propsFor(registration) {
+function propsFor(registration, sessionId) {
+  // A session-scoped slot's `inject` is called with the session it renders for;
+  // calling it with nothing would hand the component a different directory than
+  // the one a test mutates, and the gate would pass for the wrong reason.
   const face = typeof registration.options.inject === 'function'
-    ? (Array.isArray(registration.options.inject) ? registration.options.inject() : registration.options.inject())
+    ? registration.options.inject(sessionId)
     : {}
   const injected = face?.hooks === undefined
     ? face
@@ -625,11 +688,17 @@ function renderWith(primitives, registration) {
     logger: { info() {}, warn() {}, error() {} },
     slots,
     connection: connectionService,
+    modelDirectories: { directoryFor: () => ({ store: { getSnapshot: () => ({ current: null }), subscribe: () => () => {} } }) },
     effect: (body) => {
       const dispose = body()
       return typeof dispose === 'function' ? dispose : () => {}
     },
-    get: (name) => (name === 'slots' ? slots : name === 'connection' ? connectionService : undefined),
+    get(name) {
+      if (name === 'slots') return slots
+      if (name === 'connection') return connectionService
+      if (name === 'modelDirectories') return this.modelDirectories
+      return undefined
+    },
   }
   exportsUnderTest.apply(ctx)
   const target = seen.find((entry) => entry.options.name === registration)
@@ -684,14 +753,21 @@ for (const [label, names, expected] of [
 {
   const hooks = []
   let cursor = 0
+  // The settings panel's cards fold on a boolean and the copy under test lives in
+  // the body, so its `false` states are opened. The usage pill's booleans are
+  // data and interaction state — coercing those renders its failure posture and
+  // an already-expanded card — so it renders with this off.
+  let coerced = true
   const React = {
     createElement,
     Fragment: Symbol('Fragment'),
     useState(initial) {
       const index = cursor++
       if (!(index in hooks)) hooks[index] = typeof initial === 'function' ? initial() : initial
-      // A boolean in this panel is a disclosure, and the card under test is the
-      // folded body one guards.
+      // A boolean in the settings panel is a disclosure, and the card under test
+      // is the folded body one guards. The usage pill's booleans are failure and
+      // disclosure flags read from data, so coercing those would make it render
+      // its failed posture instead of its reading.
       if (hooks[index] === false) hooks[index] = true
       return [hooks[index], (next) => { hooks[index] = typeof next === 'function' ? next(hooks[index]) : next }]
     },
@@ -699,6 +775,10 @@ for (const [label, names, expected] of [
     useMemo(factory) { cursor += 1; return factory() },
     useRef(initial) { cursor += 1; return { current: initial } },
     useCallback(callback) { cursor += 1; return callback },
+    // The usage pill learns the selected provider through this. Reading the
+    // snapshot (rather than a constant) is what lets a test move the selection
+    // and assert the pill re-gates.
+    useSyncExternalStore(subscribe, getSnapshot) { return getSnapshot() },
   }
   const load = []
   const win = { __ModuleLoader__: { load: (entry) => load.push(entry) }, document: documentStub }
@@ -712,6 +792,33 @@ for (const [label, names, expected] of [
     else globalThis.window = previousWindow
   }
   const seen = []
+  /**
+   * A model-selection directory stand-in.
+   *
+   * The usage pill subscribes to this to learn the selected provider, so the
+   * store has to behave like the real one: a snapshot plus a subscribe that
+   * fires on change. A stub that only exposed the current value would let a pill
+   * that never re-gates on a model switch pass.
+   */
+  const makeDirectory = (initial = { current: null }) => {
+    let snapshot = initial
+    const listeners = new Set()
+    return {
+      store: {
+        getSnapshot: () => snapshot,
+        subscribe: (listener) => { listeners.add(listener); return () => listeners.delete(listener) },
+      },
+      set: (next) => { snapshot = next; listeners.forEach((listener) => listener()) },
+    }
+  }
+  const directories = new Map()
+  const modelDirectories = {
+    directoryFor: (sessionId) => {
+      if (!directories.has(sessionId)) directories.set(sessionId, makeDirectory())
+      return directories.get(sessionId)
+    },
+  }
+
   const slots = {
     inject: (key, callback) => { callback(); return () => {} },
     register: (options, component) => { seen.push({ options, component }); return () => {} },
@@ -720,8 +827,9 @@ for (const [label, names, expected] of [
     logger: { info() {}, warn() {}, error() {} },
     slots,
     connection: connectionService,
+    modelDirectories,
     effect: (body) => { const dispose = body(); return typeof dispose === 'function' ? dispose : () => {} },
-    get: (name) => (name === 'slots' ? slots : name === 'connection' ? connectionService : undefined),
+    get: (name) => (name === 'slots' ? slots : name === 'connection' ? connectionService : name === 'modelDirectories' ? modelDirectories : undefined),
   })
   const card = seen.find((entry) => entry.options.name === 'settings.plugins.tab').component
   const cardProps = propsFor(seen.find((entry) => entry.options.name === 'settings.plugins.tab'))
@@ -827,6 +935,126 @@ for (const [label, names, expected] of [
   check('round-robin shows no current badge', !quota(copy(render())).includes('当前'), quota(copy(render())).slice(0, 120))
   // An empty `activeAccount` means "first enabled", not "none".
   check('an empty activeAccount resolves to the first enabled account', JSON.stringify(badgeOn('single', '')) === JSON.stringify(['名字 a']), JSON.stringify(badgeOn('single', '')))
+
+  // ── the usage pill beside the model selector ────────────────────────────────
+  //
+  // The pill is the only surface that reads the model selection, and the gate is
+  // the whole reason it exists: a pill that polled the gateway for every model
+  // would spend a request per conversation. Both postures are asserted, plus the
+  // reading itself, so neither the gate nor the rendering can regress silently.
+  {
+    const pillEntry = seen.find((entry) => entry.options.name === 'conversation.input.right')
+    const pillProps = propsFor(pillEntry, 'pill-session')
+    // The shared stub answers state without a reading, so the pill would render
+    // its empty posture. Give this one the shape the host actually returns for
+    // `usage`, so the assertions below are about the rendering and not about a
+    // stub that never carried the data.
+    const pillLimits = [
+      { type: 'five_hour', percentUsed: 6, resetsAt: new Date(Date.now() + 3_600_000).toISOString() },
+      { type: 'weekly', percentUsed: 2, resetsAt: new Date(Date.now() + 86_400_000).toISOString() },
+      { type: 'monthly', percentUsed: 48, resetsAt: new Date(Date.now() + 172_800_000).toISOString() },
+    ]
+    pillProps.readUsage = async () => ({
+      usage: { fetchedAt: Date.now(), accounts: [{ account: 'default', displayName: 'Cline Pass', ok: true, limits: pillLimits }] },
+    })
+    /**
+     * Render the pill with its effects run, the way the host does.
+     *
+     * The reading arrives from the RPC inside an effect — the panel's own tests
+     * had to do this for the same reason — so a render without running them only
+     * ever shows the pre-fetch state.
+     */
+    /**
+     * Render the pill the way the shell does: one pass, run its effects, then a
+     * second pass that sees the state those effects set. The bundle-level React
+     * table owns that state, so it is reset per render pass here.
+     */
+    const pillText = async () => {
+      // The component reads React from the bundle's own `require('react')`, whose
+      // table is this block's `hooks`/`cursor` — not the one `runComponent`
+      // returns. Hook state is kept across the two passes so the reading the
+      // effect set survives; the cursor restarts so the second pass reads the
+      // same slots the first one wrote.
+      hooks.length = 0
+      cursor = 0
+      collectedEffects.length = 0
+      coerced = false
+      try {
+        runComponent(pillEntry.component, { ...pillProps })
+      } finally {
+        coerced = true
+      }
+      // The effect arms a 60s interval. Its cleanup is what stops that timer, so
+      // it has to be called or the process never exits — and the timer is the
+      // same one that would keep polling a mounted pill.
+      const cleanups = []
+      for (const effect of collectedEffects) {
+        const dispose = effect()
+        if (typeof dispose === 'function') cleanups.push(dispose)
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      for (const dispose of cleanups) dispose()
+      cursor = 0
+      coerced = false
+      let second
+      try {
+        second = runComponent(pillEntry.component, { ...pillProps })
+      } finally {
+        coerced = true
+      }
+      cursor = 0
+      return collectText(resolveComponents(second.tree)).join(' ')
+    }
+    // The same session the props were built for, so the store the pill
+    // subscribes to is the one this test moves.
+    const sessionId = 'pill-session'
+    const directory = modelDirectories.directoryFor(sessionId)
+
+    // Another provider's model selected: the pill must render nothing at all.
+    directory.set({ current: { provider: 'deepseek', model: 'deepseek-v4.1-flash' } })
+    check('the usage pill is absent under another provider', (await pillText()) === '', (await pillText()).slice(0, 80))
+
+    // This provider selected: the pill renders its reading.
+    directory.set({ current: { provider: 'cline-pass', model: 'cline-pass/glm-5.3' } })
+    const shown = await pillText()
+    check('the usage pill renders under this provider', shown.includes('Pass'), shown.slice(0, 160))
+    // The collapsed button's OWN text, found by its class. Asserting against the
+    // whole rendered tree would pass even if the summary lost a window, because
+    // the expanded card names the same windows.
+    const summaryText = () => {
+      // Keep the hook state the fetch wrote (so the reading is on screen); only
+      // restart the cursor, which is what makes this pass read the same slots.
+      cursor = 0
+      coerced = false
+      let tree
+      try {
+        tree = runComponent(pillEntry.component, { ...pillProps }).tree
+      } finally {
+        coerced = true
+      }
+      cursor = 0
+      let found = null
+      const walk = (node) => {
+        if (node === null || node === undefined || typeof node !== 'object' || found !== null) return
+        if (Array.isArray(node)) { node.forEach(walk); return }
+        if (node.props?.className === 'cp-pill-btn') { found = node; return }
+        walk(node.children)
+      }
+      walk(tree)
+      return found === null ? '' : collectText({ ...found, children: found.children }).join('')
+    }
+    // Populate the reading the way the host does, then read the button alone.
+    await pillText()
+    const collapsed = summaryText()
+    check('the collapsed pill summarises the five-hour and weekly windows',
+      collapsed.includes('5 小时 6%') && collapsed.includes('周 2%'), JSON.stringify(collapsed))
+    // `chargeUsage` is what the injected face hands the component; the first
+    // paint must not have called it, because the effect only runs when the host
+    // runs effects and the pill is asserted here before that.
+    check('the pill follows the selection rather than a captured value',
+      typeof pillEntry.options.inject === 'function' && typeof pillEntry.options.inject(sessionId).route === 'function')
+
+  }
 
   store.set(snapshot)
 }
