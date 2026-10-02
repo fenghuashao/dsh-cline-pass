@@ -1509,6 +1509,41 @@ try {
   check('tool message is emitted', toolIndex !== -1, JSON.stringify(toolWire))
   check('tool-result image rides a following user message', imgUserIndex > toolIndex, `tool=${toolIndex} imgUser=${imgUserIndex}`)
   check('tool-result image has data URI url', toolWire[imgUserIndex]?.content?.some(p => p.type === 'image_url' && p.image_url?.url?.startsWith('data:image/png;base64,')), JSON.stringify(toolWire[imgUserIndex]))
+
+  // ── tool-role messages: the shape dsh >= 0.2.0 sends ──────────────────────
+  // A harness tool result is now a `tool`-role message whose call identity sits
+  // on the message, not a user message wrapping a `tool-result` block. The wire
+  // request is invalid whenever an assistant message carrying tool calls is not
+  // followed by the answer to every call in it.
+  const toolRoleMessages = [
+    { role: 'user', content: [{ type: 'text', text: 'run both' }] },
+    { role: 'assistant', content: [
+      { type: 'tool-call', id: 'call-a', name: 'bash', arguments: '{"command":"pwd"}' },
+      { type: 'tool-call', id: 'call-b', name: 'read', arguments: '{"file_path":"x"}' },
+    ] },
+    { role: 'tool', toolCallId: 'call-a', content: [{ type: 'text', text: 'a out' }] },
+    { role: 'tool', toolCallId: 'call-b', content: [{ type: 'text', text: 'b out' }] },
+  ]
+  const toolRoleWire = buildRequestBody({ model: 'cline-pass/deepseek-v4.1-flash', messages: toolRoleMessages }, {}).messages
+  check('tool-role results are emitted as tool messages', toolRoleWire.length === 4 && toolRoleWire.slice(2).every(m => m.role === 'tool'), JSON.stringify(toolRoleWire))
+  check('a parallel group is answered before the next user turn', toolRoleWire[2]?.role === 'tool' && toolRoleWire[3]?.role === 'tool', JSON.stringify(toolRoleWire))
+  check('tool messages answer their call id', toolRoleWire[2]?.tool_call_id === 'call-a' && toolRoleWire[3]?.tool_call_id === 'call-b', JSON.stringify(toolRoleWire))
+  check('tool message content is the flattened result text', toolRoleWire[2]?.content === 'a out', JSON.stringify(toolRoleWire[2]))
+
+  const emptyToolWire = buildRequestBody({ model: 'cline-pass/deepseek-v4.1-flash', messages: [
+    { role: 'assistant', content: [{ type: 'tool-call', id: 'call-e', name: 'bash', arguments: '{}' }] },
+    { role: 'tool', toolCallId: 'call-e', content: [] },
+  ] }, {}).messages
+  check('a tool result with no text still answers its call', emptyToolWire[1]?.role === 'tool' && emptyToolWire[1]?.content === '(no output)', JSON.stringify(emptyToolWire))
+
+  const toolRoleImageMessages = [
+    { role: 'assistant', content: [{ type: 'tool-call', id: 'call-img', name: 'read_image', arguments: '{}' }] },
+    { role: 'tool', toolCallId: 'call-img', content: [{ type: 'text', text: 'shot' }, { type: 'image', attachment: dummyRef }] },
+  ]
+  const toolRoleImagePrepared = await prepareRequestImages(toolRoleImageMessages, mockAttachments, DEFAULT_REQUEST_IMAGE_POLICY)
+  const toolRoleImageWire = buildRequestBody({ model: 'cline-pass/deepseek-v4.1-flash', messages: toolRoleImageMessages }, {}, toolRoleImagePrepared).messages
+  check('a tool-role tool message is emitted', toolRoleImageWire[1]?.role === 'tool' && toolRoleImageWire[1]?.tool_call_id === 'call-img', JSON.stringify(toolRoleImageWire))
+  check('an image inside a tool-role result rides a following user message', toolRoleImageWire[2]?.role === 'user' && Array.isArray(toolRoleImageWire[2]?.content) && toolRoleImageWire[2].content.some(p => p.type === 'image_url'), JSON.stringify(toolRoleImageWire))
 } catch (error) {
   failures.push(`unexpected failure — ${error?.stack ?? error}`)
 }
