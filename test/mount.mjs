@@ -425,9 +425,59 @@ try {
   const added = await panelPost(envelope('account.add', { name: 'doomed', key: 'sk_doomed_key_123456' }), cookie)
   check('the panel adds a second account', added.json?.ok === true && (await readAccounts()).some((account) => account.key === 'doomed'), `${added.status} — ${JSON.stringify((await readAccounts()).map((a) => a.key))}`)
 
+  // ── the reading follows the account a request would use ───────────────────
+  //
+  // With a pool, `activeAccount` is only the single-mode choice and usage is per
+  // account, so a surface that names the wrong one describes quota that is not
+  // about to be spent. The host has to say which account is in line; the client
+  // cannot work it out, and before this it simply took the first one that read.
+  const chooseAccount = async (active) => {
+    await panelPost(envelope('account.mode', { mode: 'single', active }), cookie)
+    const response = await panelPost(envelope('state'), cookie)
+    return response.json?.value?.effectiveAccount
+  }
+  check('the reading follows the account the pool is pointed at',
+    await chooseAccount('doomed') === 'doomed', `effective=${await chooseAccount('doomed')}`)
+  check('the reading returns to the first enabled account when none is chosen',
+    await chooseAccount('') === 'default', `effective=${await chooseAccount('')}`)
+
+  // The pill takes the account from the `usage` reply, which is this same state
+  // plus a reading, so the field has to travel there too — a client that only
+  // found it on `state` would fall back to its own older copy.
+  const usageReply = await panelPost(envelope('usage'), cookie)
+  check('the usage reply carries the account a request would use',
+    usageReply.json?.value?.effectiveAccount === 'default',
+    JSON.stringify(usageReply.json?.value?.effectiveAccount))
+
+  // In round-robin no single account represents the pool: a request takes the
+  // one the cursor points at and advances it, so a reading pinned to the first
+  // account describes a key that is only sometimes the one being spent.
+  await panelPost(envelope('account.mode', { mode: 'roundrobin', active: '' }), cookie)
+  const readEffective = async () => (await panelPost(envelope('state'), cookie)).json?.value?.effectiveAccount
+  const beforeTurn = await readEffective()
+  let streamed = false
+  try {
+    for await (const chunk of llm.stream({ provider: 'cline-pass', model: 'cline-pass/glm-5.2', messages: [userMessage('advance')] })) {
+      if (chunk.type === 'text-delta') streamed = true
+    }
+  } catch { /* the rotation already moved; the reading is what is under test */ }
+  const afterTurn = await readEffective()
+  check('a pool rotates the reading to the account the next request would use',
+    beforeTurn !== afterTurn && beforeTurn !== '' && afterTurn !== '',
+    `${beforeTurn} -> ${afterTurn} (streamed=${streamed})`)
+  // Reading quota is not a request, so asking must not consume a turn of its own.
+  check('reading the quota does not consume a round-robin turn',
+    await readEffective() === afterTurn, `${afterTurn} -> ${await readEffective()}`)
+  await panelPost(envelope('account.mode', { mode: 'single', active: '' }), cookie)
+
   const removed = await panelPost(envelope('account.remove', { name: 'doomed' }), cookie)
   const remaining = await readAccounts()
   check('a removed account is gone from the state', removed.json?.ok === true && !remaining.some((account) => account.key === 'doomed'), `${removed.status} — ${JSON.stringify(remaining.map((a) => a.key))}`)
+  // The account that was in line is gone, so the reading has to name another one
+  // rather than keep pointing at a key that no longer exists.
+  check('the reading survives the account it named being removed',
+    (await panelPost(envelope('state'), cookie)).json?.value?.effectiveAccount === 'default',
+    JSON.stringify((await panelPost(envelope('state'), cookie)).json?.value?.effectiveAccount))
   // The service is the authority: re-read the document rather than trusting the
   // panel's own projection of it.
   const sideDocuments = [

@@ -768,7 +768,7 @@ for (const [label, names, expected] of [
       // is the folded body one guards. The usage pill's booleans are failure and
       // disclosure flags read from data, so coercing those would make it render
       // its failed posture instead of its reading.
-      if (hooks[index] === false) hooks[index] = true
+      if (hooks[index] === false && coerced) hooks[index] = true
       return [hooks[index], (next) => { hooks[index] = typeof next === 'function' ? next(hooks[index]) : next }]
     },
     useEffect(callback) { collectedEffects.push(callback) },
@@ -859,6 +859,10 @@ for (const [label, names, expected] of [
     status: 'ready',
     data: {
       provider: 'cline-pass', ready: true, settingsAvailable: true, accountMode: mode, activeAccount: active,
+      // The host resolves which account a request would use. The stub mirrors it:
+      // single mode honours `activeAccount`, and a pool without a cursor takes the
+      // first enabled one.
+      effectiveAccount: active !== '' ? active : (accounts[0] ?? ''),
       accounts: accounts.map((key) => ({ key, enabled: true, declared: true })),
       models: [], pinnedModels: 0, hiddenModels: 0, catalogCount: 0, historySize: 0,
       usage: { fetchedAt: Date.now(), accounts: accounts.map((key, index) => reading(key, [11, 22, 33][index] ?? 44, key !== 'b')) },
@@ -880,22 +884,33 @@ for (const [label, names, expected] of [
     return true
   }
 
+  // The card opens on the account a request would use, which is the reading the
+  // pool was opened for. The first entry is not it: usage is per account, so
+  // starting there answers a question about a key that may not be about to be used.
   show(['a', 'b', 'c'], 'single', 'b')
   let view = copy(render())
-  check('the quota card shows one account at a time', view.includes('名字 a') && !view.includes('名字 b') && !view.includes('名字 c'), quota(view).slice(0, 120))
-  check('the quota card shows which account of how many', view.includes('1 / 3'), quota(view).slice(0, 120))
+  check('the quota card opens on the account a request would use',
+    view.includes('名字 b') && !view.includes('名字 a') && !view.includes('名字 c'), quota(view).slice(0, 120))
+  check('the quota card shows which account of how many', view.includes('2 / 3'), quota(view).slice(0, 120))
+  // The account in line is shown even when its own read failed, rather than a
+  // healthy reading borrowed from an account the request will not touch.
+  check('an account whose read failed still shows its own error', view.includes('读不到'), quota(view).slice(0, 160))
 
   check('the quota card offers a next-account control', click(next), 'no button')
   view = copy(render())
-  check('next moves to the second account', view.includes('名字 b'), quota(view).slice(0, 120))
-  check('an account whose read failed still shows its own error', view.includes('读不到'), quota(view).slice(0, 160))
-  click(next); view = copy(render())
-  check('next moves to the third account', view.includes('名字 c') && view.includes('3 / 3'), quota(view).slice(0, 120))
+  check('next moves to the following account', view.includes('名字 c') && view.includes('3 / 3'), quota(view).slice(0, 120))
   click(next); view = copy(render())
   check('next wraps back to the first account', view.includes('名字 a') && view.includes('1 / 3'), quota(view).slice(0, 120))
   check('the quota card offers a previous-account control', click(prev), 'no button')
   view = copy(render())
   check('previous wraps backwards to the last account', view.includes('名字 c') && view.includes('3 / 3'), quota(view).slice(0, 120))
+
+  // Paging is the user's: the account in line moving underneath must not yank the
+  // card off the account they are reading.
+  show(['a', 'b', 'c'], 'single', 'a')
+  view = copy(render())
+  check('a paged card keeps the page the user chose',
+    view.includes('名字 c') && view.includes('3 / 3'), quota(view).slice(0, 120))
 
   // Removing accounts shortens the reading under a selection that is now past
   // its end; the card must clamp rather than index off the list.
@@ -954,7 +969,23 @@ for (const [label, names, expected] of [
       { type: 'weekly', percentUsed: 2, resetsAt: new Date(Date.now() + 86_400_000).toISOString() },
       { type: 'monthly', percentUsed: 48, resetsAt: new Date(Date.now() + 172_800_000).toISOString() },
     ]
-    pillProps.readUsage = async () => ({
+    /**
+     * Stand in for the host's `usage` reply.
+     *
+     * The real read also lands its result in the panel's snapshot, and the pill
+     * takes the effective account from there — a switch updates that snapshot at
+     * once while a reading only arrives on a timer. A stub that only returned the
+     * payload would leave the store naming an account this test never set.
+     */
+    const replyUsage = (payload) => {
+      pillProps.readUsage = async () => {
+        const state = store.getSnapshot()
+        store.set({ ...state, status: 'ready', data: { ...state.data, ...payload } })
+        return payload
+      }
+    }
+    replyUsage({
+      effectiveAccount: 'default',
       usage: { fetchedAt: Date.now(), accounts: [{ account: 'default', displayName: 'Cline Pass', ok: true, limits: pillLimits }] },
     })
     /**
@@ -1053,6 +1084,167 @@ for (const [label, names, expected] of [
     // runs effects and the pill is asserted here before that.
     check('the pill follows the selection rather than a captured value',
       typeof pillEntry.options.inject === 'function' && typeof pillEntry.options.inject(sessionId).route === 'function')
+
+    // The reported bug: with a pool the pill showed the first account that
+    // answered rather than the one a request would spend. Quota is per account,
+    // so a healthy reading from the wrong key is worse than none — it answers a
+    // question about a key that is not about to be used.
+    const at = (hours) => new Date(Date.now() + hours * 3_600_000).toISOString()
+    /** Two accounts with distinguishable readings, and the host's pick. */
+    const poolOf = (effectiveAccount) => ({
+      effectiveAccount,
+      usage: {
+        fetchedAt: Date.now(),
+        accounts: [
+          { account: 'primary', displayName: 'Primary', ok: true, limits: [
+            { type: 'five_hour', percentUsed: 11, resetsAt: at(1) },
+            { type: 'weekly', percentUsed: 22, resetsAt: at(24) },
+          ] },
+          { account: 'backup', displayName: 'Backup', ok: true, limits: [
+            { type: 'five_hour', percentUsed: 66, resetsAt: at(1) },
+            { type: 'weekly', percentUsed: 77, resetsAt: at(24) },
+          ] },
+        ],
+      },
+    })
+    replyUsage(poolOf('backup'))
+    await pillText()
+    const pooled = summaryText()
+    check('the pill reads the account a request would use, not the first that answered',
+      pooled.includes('66%') && pooled.includes('77%') && !pooled.includes('11%'),
+      JSON.stringify(pooled))
+
+    // A pool whose effective account has no readable quota must say so rather
+    // than fall back to a healthy account the request will not touch.
+    replyUsage({
+      effectiveAccount: 'broken',
+      usage: {
+        fetchedAt: Date.now(),
+        accounts: [
+          { account: 'primary', displayName: 'Primary', ok: true, limits: [
+            { type: 'five_hour', percentUsed: 11, resetsAt: at(1) },
+          ] },
+          { account: 'broken', displayName: 'Broken', ok: false, limits: [], error: 'no API key stored for broken' },
+        ],
+      },
+    })
+    await pillText()
+    const brokenPool = summaryText()
+    check('the pill does not substitute a different account when the effective one cannot be read',
+      !brokenPool.includes('11%'), JSON.stringify(brokenPool))
+
+    // ── the popover moves between accounts ──────────────────────────────────
+    //
+    // Quota is per account, so a pool is reviewed one at a time — the same
+    // behaviour the settings card has. Without this the pill could only ever show
+    // whichever account the host named, and a pool's other accounts were
+    // unreachable from the model selector entirely.
+    replyUsage(poolOf('primary'))
+    /** One render pass, keeping the hook state the previous pass wrote. */
+    const pillTree = () => {
+      cursor = 0
+      coerced = false
+      let tree
+      try {
+        tree = runComponent(pillEntry.component, { ...pillProps }).tree
+      } finally {
+        coerced = true
+      }
+      cursor = 0
+      return tree
+    }
+    const findIn = (tree, match) => {
+      let found = null
+      const walk = (node) => {
+        if (node === null || node === undefined || typeof node !== 'object' || found !== null) return
+        if (Array.isArray(node)) { node.forEach(walk); return }
+        if (match(node)) { found = node; return }
+        walk(node.children)
+      }
+      walk(tree)
+      return found
+    }
+    const pillText2 = () => collectText(resolveComponents(pillTree())).join(' ')
+
+    await pillText()
+    // Open it the way a user does, rather than by forcing the disclosure state.
+    const opener = findIn(pillTree(), (node) => node.props?.className === 'cp-pill-btn')
+    check('the pill offers a disclosure control', opener !== null && typeof opener.props?.onClick === 'function')
+    opener?.props?.onClick?.()
+
+    const firstPage = pillText2()
+    check('the popover opens on the account a request would use',
+      firstPage.includes('Primary') && firstPage.includes('1 / 2') && firstPage.includes('11%'),
+      firstPage.slice(0, 200))
+
+    const arrow = (label) => findIn(pillTree(), (node) => node.props?.['aria-label'] === label)
+    const nextArrow = arrow('下一个账号')
+    check('the popover offers a next-account control', nextArrow !== null && typeof nextArrow.props?.onClick === 'function')
+    // Guarded: a missing control must fail its own check rather than throw and
+    // hide every assertion after it.
+    nextArrow?.props?.onClick?.()
+    const secondPage = pillText2()
+    check('the popover moves to the next account',
+      secondPage.includes('Backup') && secondPage.includes('2 / 2') && secondPage.includes('66%'),
+      secondPage.slice(0, 200))
+
+    // The account a request would use moving underneath must not yank the reading
+    // off the page the user chose: the host still names `primary`, and the popover
+    // has to stay on the account the user turned to.
+    const held = pillText2()
+    check('a paged popover keeps the page the user chose',
+      held.includes('Backup') && held.includes('2 / 2') && held.includes('66%') && !held.includes('Primary'),
+      held.slice(0, 200))
+
+    // ── the popover follows an account switched elsewhere ───────────────────
+    //
+    // Switching accounts is a panel action: it lands in the shared snapshot at
+    // once, whereas a usage reading only arrives on mount and on a timer. Taking
+    // the account from the reading is what left the popover naming the previous
+    // account after the settings card had already moved.
+    replyUsage(poolOf('primary'))
+    await pillText()
+    findIn(pillTree(), (node) => node.props?.className === 'cp-pill-btn')?.props?.onClick?.()
+    check('the popover opens on the account the host named',
+      pillText2().includes('Primary'), pillText2().slice(0, 160))
+
+    // The settings page switches accounts. No usage read is taken here: the point
+    // is that the snapshot alone has to carry it.
+    const switchedFrom = store.getSnapshot()
+    store.set({ ...switchedFrom, data: { ...switchedFrom.data, effectiveAccount: 'backup' } })
+    const switched = pillText2()
+    check('the popover follows an account switched in the settings page',
+      switched.includes('Backup') && switched.includes('66%') && !switched.includes('Primary'),
+      switched.slice(0, 200))
+
+    // Closing forgets the page, so reopening after a switch shows the account a
+    // request would use rather than the page left behind.
+    replyUsage(poolOf('primary'))
+    await pillText()
+    const clickPill = () => findIn(pillTree(), (node) => node.props?.className === 'cp-pill-btn')?.props?.onClick?.()
+    /** Run the effects a render registered, the way the host does after paint. */
+    const runEffects = async () => {
+      collectedEffects.length = 0
+      pillTree()
+      const cleanups = []
+      for (const effect of collectedEffects) {
+        const dispose = effect()
+        if (typeof dispose === 'function') cleanups.push(dispose)
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      for (const dispose of cleanups) dispose()
+    }
+    clickPill()
+    findIn(pillTree(), (node) => node.props?.['aria-label'] === '下一个账号')?.props?.onClick?.()
+    check('the popover can be moved before it is closed',
+      pillText2().includes('Backup') && pillText2().includes('2 / 2'), pillText2().slice(0, 160))
+    clickPill()
+    await runEffects()
+    clickPill()
+    const reopened = pillText2()
+    check('reopening returns to the account a request would use',
+      reopened.includes('Primary') && reopened.includes('1 / 2') && !reopened.includes('Backup'),
+      reopened.slice(0, 200))
 
   }
 

@@ -910,6 +910,16 @@ try {
     settingsAvailable: () => true,
     routeRegistered: () => true,
     readConfig: () => section,
+    // The account a request would use, mirroring the host: a pool resolves to its
+    // first enabled account and single mode honours `activeAccount`. The stub has
+    // no round-robin cursor, so it cannot model a cursor that has advanced.
+    effectiveAccount: () => {
+      const enabled = accountProfilesOf(section).filter((account) => account.enabled)
+      const chosen = section.accountMode === 'roundrobin'
+        ? enabled[0]
+        : enabled.find((account) => String(account.key) === String(section.activeAccount ?? '')) ?? enabled[0]
+      return chosen === undefined ? '' : String(chosen.key)
+    },
     updateConfig: async (patch) => { section = { ...section, ...patch } },
     accounts: () => accountProfilesOf(section),
     accountsWithKeys: async () => await Promise.all(accountProfilesOf(section).map(async (account) => {
