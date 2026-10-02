@@ -18,7 +18,7 @@ import { createServer } from 'node:http'
 import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
 import { createAssistantMessage, createDeveloperMessage, createToolResultMessage } from '@deepseek-ai/dsh-llm'
 import { ClinePassAdapter, Config, DEFAULT_REQUEST_IMAGE_POLICY, apply, inject, name } from '../lib/index.js'
-import { buildRequestBody, createUpstreamSlots, prepareRequestImages, projectImageDimensions, reasoningOf, requestImageTarget } from '../lib/adapter.js'
+import { buildRequestBody, createUpstreamSlots, DEFAULT_MAX_TOKENS, prepareRequestImages, projectImageDimensions, reasoningOf, requestImageTarget } from '../lib/adapter.js'
 import { createEngine } from '../lib/engine.js'
 import { createPanel, PANEL_ERROR_CODE, PANEL_PATH, registerPanel } from '../lib/panel.js'
 import {
@@ -1194,7 +1194,14 @@ try {
   // ── model metadata on the seam ────────────────────────────────────────────
   const resolved = await plain.adapter.resolveModel('cline-pass', 'cline-pass/deepseek-v4.1-flash')
   check('published context window is advertised, not the route default', resolved.context.contextWindow === 1000000, String(resolved.context.contextWindow))
-  check('published output cap is advertised', resolved.defaultMaxTokens === 384000, String(resolved.defaultMaxTokens))
+  // A budget, not the model's ceiling: the harness fills `max_tokens` from this and
+  // reserves the same number as completion room, so advertising the published 384k
+  // would compact a 1M window at 55% instead of the 80% the threshold ratio asks for.
+  // The configured budget here is the 32000 this harness sets, below the ceiling.
+  check('the published output ceiling bounds the budget instead of becoming it',
+    resolved.defaultMaxTokens === 32000
+      && resolved.defaultMaxTokens < MODEL_CATALOG['cline-pass/deepseek-v4.1-flash'].maxTokens,
+    String(resolved.defaultMaxTokens))
   check('the model name is its display name', resolved.name === 'DeepSeek V4.1 Flash', resolved.name)
   check('reasoning capability is advertised', resolved.reasoning !== undefined && resolved.reasoning.efforts.length > 0)
   const effortIds = resolved.reasoning.efforts.map((effort) => effort.id)
@@ -1251,6 +1258,44 @@ try {
     if (!expectedEfforts && entry.reasoning !== undefined) catalogProblems.push(`${id}: unexpected efforts`)
   }
   check(`all ${Object.keys(MODEL_CATALOG).length} catalog entries resolve to valid seam metadata`, catalogProblems.length === 0, catalogProblems.join(', '))
+
+  // ── the output budget, as distinct from the model's output ceiling ─────────
+  //
+  // dsh fills a request's `max_tokens` from `defaultMaxTokens` and reserves the same
+  // number as completion room before it compacts, on top of a fixed headroom. The
+  // published figure is the model's OUTPUT CEILING, so advertising it as the budget
+  // reserved that much of every window: a 384k ceiling moved compaction on a 1M
+  // window from 80% down to 55%, and the two kimi entries — whose published ceiling
+  // equals their window — left the policy no message budget at all, which it answers
+  // with an error rather than a reading.
+  const COMPACTION_HEADROOM = 65536
+  const COMPACTION_RATIO = 0.8
+  {
+    const ceiling = MODEL_CATALOG['cline-pass/deepseek-v4.1-flash'].maxTokens
+    const above = resolveModelMetadata('cline-pass', 'cline-pass/deepseek-v4.1-flash', emptyOverride, { ...fallback, maxTokens: 900000 })
+    check('a ceiling below the configured budget clamps it', above.defaultMaxTokens === ceiling, String(above.defaultMaxTokens))
+    const below = resolveModelMetadata('cline-pass', 'cline-pass/deepseek-v4.1-flash', emptyOverride, { ...fallback, maxTokens: 8000 })
+    check('a ceiling above the configured budget leaves it alone', below.defaultMaxTokens === 8000, String(below.defaultMaxTokens))
+    // kimi-k2.6 publishes a ceiling equal to its whole window; a hand-set budget past
+    // half of it is pulled back so the reserve always leaves room to compact into.
+    const guarded = resolveModelMetadata('cline-pass', 'cline-pass/kimi-k2.6', emptyOverride, { ...fallback, maxTokens: 900000 })
+    check('a budget hand-set past half the window is pulled back to it',
+      guarded.defaultMaxTokens === Math.floor(MODEL_CATALOG['cline-pass/kimi-k2.6'].contextWindow / 2), String(guarded.defaultMaxTokens))
+
+    const ratios = Object.keys(MODEL_CATALOG).map((id) => {
+      const entry = resolveModelMetadata('cline-pass', id, emptyOverride, { ...fallback, maxTokens: DEFAULT_MAX_TOKENS })
+      const window = entry.context.contextWindow
+      const pressure = window - entry.defaultMaxTokens - COMPACTION_HEADROOM
+      return { id, ratio: pressure <= 0 ? 0 : Math.min(window * COMPACTION_RATIO, pressure) / window }
+    })
+    check('no catalog model leaves the compaction policy without a message budget',
+      ratios.every(({ ratio }) => ratio > 0),
+      ratios.filter(({ ratio }) => ratio <= 0).map(({ id }) => id).join(', '))
+    // The two that used to throw both sit exactly on the half-window bound.
+    check('the models whose ceiling equals their window still compact late enough',
+      ratios.filter(({ id }) => id.includes('kimi-k2.')).every(({ ratio }) => ratio >= 0.25),
+      JSON.stringify(ratios.filter(({ id }) => id.includes('kimi-k2.')).map(({ id, ratio }) => [id, Number(ratio.toFixed(3))])))
+  }
   check('the effort list matches the gateway vocabulary exactly', REASONING_EFFORTS.map((effort) => effort.id).join(',') === 'none,minimal,low,medium,high,xhigh,max', REASONING_EFFORTS.map((effort) => effort.id).join(','))
   check('an explicit per-model effort override hides the picker', resolveModelMetadata('cline-pass', 'cline-pass/deepseek-v4.1-flash', { reasoning: false }, fallback).reasoning === undefined)
 
@@ -1274,7 +1319,8 @@ try {
     check('published modalities reach a new model', resolved.inputModalities.join('+') === 'text+image', JSON.stringify(resolved.inputModalities))
     check('published modalities are clamped to the seam vocabulary', resolved.inputModalities.every((m) => m === 'text' || m === 'image'), JSON.stringify(resolved.inputModalities))
     check('the published context window reaches a new model', resolved.context.contextWindow === published.contextWindow, String(resolved.context.contextWindow))
-    check('the published output cap reaches a new model', resolved.defaultMaxTokens === published.maxTokens, String(resolved.defaultMaxTokens))
+    check('a published output ceiling bounds a new model budget too',
+      resolved.defaultMaxTokens === Math.min(fallback.maxTokens, published.maxTokens), String(resolved.defaultMaxTokens))
     check('the published display name reaches a new model', resolved.name === published.name, resolved.name)
 
     // The shipped table is curated, so it stays the reference for what it knows:

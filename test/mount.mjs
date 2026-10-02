@@ -258,6 +258,14 @@ try {
   check('a model call streams through the runtime', text === 'served by alibaba', JSON.stringify(chunks))
   check('the stream finishes', chunks.at(-1)?.type === 'finish', JSON.stringify(chunks.at(-1)))
   check('the stub received the call with usage requested', received.length === 1 && received[0].stream === true && received[0].stream_options?.include_usage === true, JSON.stringify(received))
+  // The outgoing `max_tokens` is the configured per-request BUDGET, not the model's
+  // published output ceiling. dsh fills it from `defaultMaxTokens` and reserves the
+  // same number as completion room, so sending the ceiling would reserve 131k of this
+  // model's window on every call and compact it well below the threshold ratio.
+  const ceiling = (await import('../lib/catalog.js')).catalogEntry('cline-pass/glm-5.2').maxTokens
+  check('the outgoing request asks for the budget, not the model output ceiling',
+    Number.isInteger(received[0].max_tokens) && received[0].max_tokens < ceiling,
+    `max_tokens=${received[0].max_tokens} ceiling=${ceiling}`)
 
   // A pin written through the settings document must reach the next request.
   const settings = ctx.get('settings')
