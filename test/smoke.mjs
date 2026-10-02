@@ -16,6 +16,7 @@
 
 import { createServer } from 'node:http'
 import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
+import { createAssistantMessage, createDeveloperMessage, createToolResultMessage } from '@deepseek-ai/dsh-llm'
 import { ClinePassAdapter, Config, DEFAULT_REQUEST_IMAGE_POLICY, apply, inject, name } from '../lib/index.js'
 import { buildRequestBody, createUpstreamSlots, prepareRequestImages, projectImageDimensions, reasoningOf, requestImageTarget } from '../lib/adapter.js'
 import { createEngine } from '../lib/engine.js'
@@ -1544,6 +1545,66 @@ try {
   const toolRoleImageWire = buildRequestBody({ model: 'cline-pass/deepseek-v4.1-flash', messages: toolRoleImageMessages }, {}, toolRoleImagePrepared).messages
   check('a tool-role tool message is emitted', toolRoleImageWire[1]?.role === 'tool' && toolRoleImageWire[1]?.tool_call_id === 'call-img', JSON.stringify(toolRoleImageWire))
   check('an image inside a tool-role result rides a following user message', toolRoleImageWire[2]?.role === 'user' && Array.isArray(toolRoleImageWire[2]?.content) && toolRoleImageWire[2].content.some(p => p.type === 'image_url'), JSON.stringify(toolRoleImageWire))
+
+  // ── the group guard: nothing may split a tool-call run ────────────────────
+  //
+  // The wire rule is that an assistant message carrying `tool_calls` is followed
+  // immediately by one `tool` message per id. A gateway that validates it rejects
+  // the whole request — "insufficient tool messages following tool_calls message"
+  // — so a message that would land inside the run has to wait for it to close.
+  // These use the host's own factories rather than hand-written literals: the
+  // previous shape bug survived because the tests spelled the shape themselves.
+  const guarded = (extra) => buildRequestBody({ model: 'cline-pass/deepseek-v4.1-flash', messages: [
+    { role: 'user', content: [{ type: 'text', text: 'run both' }] },
+    createAssistantMessage({ content: [
+      { type: 'tool-call', id: 'g-a', name: 'bash', arguments: '{}' },
+      { type: 'tool-call', id: 'g-b', name: 'bash', arguments: '{}' },
+    ] }),
+    ...extra,
+  ] }, {}).messages
+
+  const noticeBetween = guarded([
+    createDeveloperMessage({ content: [{ type: 'text', text: 'tool registry changed' }] }),
+    createToolResultMessage({ callId: 'g-a', content: [{ type: 'text', text: 'a' }], isError: false }),
+    createToolResultMessage({ callId: 'g-b', content: [{ type: 'text', text: 'b' }], isError: false }),
+  ])
+  check('a notice between an assistant tool_calls and its answers does not split the group',
+    noticeBetween[1]?.role === 'assistant' && noticeBetween[2]?.role === 'tool' && noticeBetween[3]?.role === 'tool',
+    JSON.stringify(noticeBetween.map((m) => m.role)))
+  check('the held notice is emitted once the group closes, in order',
+    noticeBetween[4]?.role === 'system' && noticeBetween[4]?.content === 'tool registry changed',
+    JSON.stringify(noticeBetween[4]))
+
+  // A `developer` notice is the harness's own system-level guidance; it must not
+  // arrive as something the user is supposed to have said.
+  const developerRoles = guarded([createDeveloperMessage({ content: [{ type: 'text', text: 'be terse' }] })])
+  check('a developer message is sent as a system message',
+    developerRoles[1]?.role === 'assistant' && developerRoles[2]?.role === 'system' && developerRoles[2]?.content === 'be terse',
+    JSON.stringify(developerRoles.map((m) => m.role)))
+
+  // The legacy shape wrapped a result in a user message that could carry text
+  // too; emitting that text first put a user turn inside the group.
+  const legacyBetween = buildRequestBody({ model: 'cline-pass/deepseek-v4.1-flash', messages: [
+    createAssistantMessage({ content: [{ type: 'tool-call', id: 'g-c', name: 'bash', arguments: '{}' }] }),
+    { role: 'user', content: [
+      { type: 'text', text: 'here is the result' },
+      { type: 'tool-result', toolCallId: 'g-c', content: [{ type: 'text', text: 'c out' }] },
+    ] },
+  ] }, {}).messages
+  check('a legacy user message carrying a result does not split the group either',
+    legacyBetween[1]?.role === 'tool' && legacyBetween[1]?.tool_call_id === 'g-c' && legacyBetween[2]?.role === 'user',
+    JSON.stringify(legacyBetween.map((m) => `${m.role}${m.tool_call_id ? '(' + m.tool_call_id + ')' : ''}`)))
+
+  // A conversation with no tool calls must serialize exactly as before: the guard
+  // is a no-op when no group is open.
+  const plainWire = buildRequestBody({ model: 'cline-pass/deepseek-v4.1-flash', messages: [
+    { role: 'user', content: [{ type: 'text', text: 'one' }] },
+    { role: 'assistant', content: [{ type: 'text', text: 'two' }] },
+    { role: 'user', content: [{ type: 'text', text: 'three' }] },
+  ] }, {}).messages
+  check('a conversation with no tool calls is untouched by the guard',
+    JSON.stringify(plainWire.map((m) => m.role)) === JSON.stringify(['user', 'assistant', 'user']),
+    JSON.stringify(plainWire.map((m) => m.role)))
 } catch (error) {
   failures.push(`unexpected failure — ${error?.stack ?? error}`)
 }
