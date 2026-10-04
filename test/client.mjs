@@ -332,6 +332,32 @@ try {
 }
 check('apply() runs without throwing', applyError === null, applyError?.message ?? '')
 
+// Current Cordis executes service methods in the consumer's context. Model
+// directories need remote.session; legacy hosts lack that service entirely.
+{
+  const modernRegistrations = []
+  const scopes = []
+  const modernSlots = { ...slotsService, register(options, component) { modernRegistrations.push({ options, component }); return () => {} } }
+  const modernCtx = {
+    ...stubCtx,
+    slots: modernSlots,
+    modelDirectories: { directoryFor() { throw new Error('remote.session was not injected into this context') } },
+    get(name) { if (name === 'remote.session') return {}; if (name === 'slots') return modernSlots; return stubCtx.get(name) },
+    inject(dependencies, callback) {
+      scopes.push(dependencies)
+      return callback({ ...this, modelDirectories: stubModelDirectories })
+    },
+  }
+  exportsValue.apply(modernCtx)
+  const usage = modernRegistrations.find((r) => r.options.name === 'conversation.input.right')
+  let injected
+  let failure
+  try { injected = usage.options.inject('modern-session') } catch (error) { failure = error }
+  check('modern usage slot gets a context with remote.session', failure === undefined, failure?.message)
+  check('modern usage slot receives the actual model selection store', injected?.directory?.getSnapshot() === stubDirectory)
+  check('only the modern host path adds the remote.session dependency', scopes.length === 1 && scopes[0].includes('remote.session'))
+}
+
 const keys = registrations.map((registration) => `${registration.options.name}:${registration.options.key ?? registration.options.id ?? ''}`)
 check('every declared slot is registered', registrations.length === 3, keys.join(' '))
 check('a Plugins tab is registered', registrations.some((registration) => registration.options.name === 'settings.plugins.tab' && registration.options.id === 'cline-pass'), keys.join(' '))

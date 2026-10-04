@@ -83,7 +83,7 @@ const gateway = createServer(async (request, response) => {
   const refusal = refusedKeys.get(accountKey)
   if (refusal !== undefined) {
     response.writeHead(refusal.status, { 'Content-Type': 'application/json' })
-    response.end(JSON.stringify({ error: { message: refusal.message } }))
+    response.end(refusal.raw ?? JSON.stringify({ error: { message: refusal.message } }))
     return
   }
   const only = body?.providerOptions?.gateway?.only ?? body?.provider?.only ?? null
@@ -537,6 +537,32 @@ try {
   await verifyAccountFailover('spent-weekly', 'sk_mount_spent_weekly', 'single', { status: 429, message: 'Weekly limit reached' })
   await verifyAccountFailover('spent-five-hour', 'sk_mount_spent_five_hour', 'roundrobin', { status: 429, message: 'five_hour window exhausted' })
   await verifyAccountFailover('spent-payment', 'sk_mount_spent_payment', 'single', { status: 402, message: 'Payment required' })
+  await verifyAccountFailover('auth-empty', 'sk_mount_auth_empty', 'single', { status: 401, message: 'HTTP 401', raw: '' })
+  await verifyAccountFailover('auth-html', 'sk_mount_auth_html', 'single', { status: 403, message: 'Access denied', raw: '<html>Access denied</html>' })
+
+  // A locally unconfigured account must be skipped before opening a request.
+  await panelPost(envelope('account.add', { name: 'missing-key', apiKeyEnv: 'MOUNT_MISSING_KEY' }), cookie)
+  for (const account of await readAccounts()) {
+    await panelPost(envelope('account.enable', { name: account.key, enabled: ['missing-key', 'backup'].includes(account.key) }), cookie)
+  }
+  await panelPost(envelope('account.mode', { mode: 'single', active: 'missing-key' }), cookie)
+  const beforeMissing = servedAccounts.length
+  const missingChunks = []
+  for await (const chunk of llm.stream({ provider: 'cline-pass', model: 'cline-pass/glm-5.2', messages: [userMessage('missing credential')] })) missingChunks.push(chunk)
+  check('missing credentials do not block a valid backup through the installed runtime', missingChunks.at(-1)?.reason?.kind === 'stop')
+  check('only the configured backup reaches the gateway', JSON.stringify(servedAccounts.slice(beforeMissing)) === JSON.stringify([backupKey]))
+  check('quota peeks skip accounts without a credential too', await readEffective() === 'backup')
+
+  // update merges objects, so replacing the pool needs explicit deletion.
+  const accountTool = tools.get('cline_pass_accounts')
+  const afterSet = await accountTool.execute({ action: 'set', accounts: [{ name: 'backup' }] }, { signal: new AbortController().signal })
+  check('full replacement removes omitted accounts in real settings', JSON.stringify(afterSet.accounts.map((a) => a.key)) === JSON.stringify(['backup']))
+  check('replacement clears an omitted active account', afterSet.activeAccount === '')
+  const replacementDocuments = [join(scratch, 'settings.yaml'), join(profileDir, 'cordis.patch.yml')].filter(existsSync).map((path) => readFileSync(path, 'utf8'))
+  check('replacement removes the old account from the persisted document', !replacementDocuments.some((text) => text.includes('missing-key')))
+  await accountTool.execute({ action: 'set', accounts: [] }, { signal: new AbortController().signal })
+  const emptyState = (await panelPost(envelope('state'), cookie)).json?.value
+  check('empty replacement removes all explicit accounts in real settings', emptyState.accounts.length === 1 && emptyState.accounts[0].key === 'default' && emptyState.accounts[0].declared === false)
 } catch (error) {
   failures.push(`unexpected failure — ${error?.stack ?? error}`)
 } finally {
