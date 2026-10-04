@@ -896,6 +896,19 @@ for (const [label, names, expected] of [
   // healthy reading borrowed from an account the request will not touch.
   check('an account whose read failed still shows its own error', view.includes('读不到'), quota(view).slice(0, 160))
 
+  show(['a'], 'single', 'new-account')
+  const missingReading = quota(copy(render()))
+  check('the quota card never borrows a reading for an account absent from its cache',
+    !missingReading.includes('11%') && missingReading.includes('账号 new-account'), missingReading)
+  const missingState = store.getSnapshot()
+  store.set({ ...missingState, data: { ...missingState.data, effectiveAccount: '' } })
+  const disabledReading = quota(copy(render()))
+  check('the quota card does not show cached quota when no account is effective',
+    !disabledReading.includes('11%') && disabledReading.includes('暂时读不到'), disabledReading)
+  store.set({ ...missingState, data: { ...missingState.data, effectiveAccount: undefined } })
+  check('the quota card still supports a host without effectiveAccount', quota(copy(render())).includes('11%'))
+  show(['a', 'b', 'c'], 'single', 'b')
+
   check('the quota card offers a next-account control', click(next), 'no button')
   view = copy(render())
   check('next moves to the following account', view.includes('名字 c') && view.includes('3 / 3'), quota(view).slice(0, 120))
@@ -1133,6 +1146,19 @@ for (const [label, names, expected] of [
     check('the pill does not substitute a different account when the effective one cannot be read',
       !brokenPool.includes('11%'), JSON.stringify(brokenPool))
 
+    replyUsage(poolOf('new-account'))
+    await pillText()
+    check('the pill never borrows quota when the effective account is absent from its cache',
+      !summaryText().includes('%'), summaryText())
+    replyUsage(poolOf(''))
+    await pillText()
+    check('the pill clears cached percentages when no account is effective',
+      !summaryText().includes('%'), summaryText())
+    replyUsage(poolOf(undefined))
+    await pillText()
+    check('the pill still supports a host without effectiveAccount',
+      summaryText().includes('11%'), summaryText())
+
     // ── the popover moves between accounts ──────────────────────────────────
     //
     // Quota is per account, so a pool is reviewed one at a time — the same
@@ -1245,6 +1271,21 @@ for (const [label, names, expected] of [
     check('reopening returns to the account a request would use',
       reopened.includes('Primary') && reopened.includes('1 / 2') && !reopened.includes('Backup'),
       reopened.slice(0, 200))
+
+    // A setting change arrives before the next usage poll. Even if that poll
+    // fails, the retained successful cache belongs to the old account.
+    const cachedState = store.getSnapshot()
+    store.set({ ...cachedState, data: { ...cachedState.data, effectiveAccount: 'new-account' } })
+    check('a panel-only account switch immediately clears unrelated cached percentages',
+      !summaryText().includes('%'), summaryText())
+    pillProps.readUsage = async () => { throw new Error('usage unavailable') }
+    await runEffects()
+    const failedRefresh = pillText2()
+    check('a failed usage poll cannot restore a different account\'s cached quota',
+      !summaryText().includes('%') && failedRefresh.includes('用量不可用') && !failedRefresh.includes('Primary'), failedRefresh)
+    store.set({ ...cachedState, data: { ...cachedState.data, effectiveAccount: '' } })
+    check('disabling all accounts clears retained quota even after a failed poll',
+      !summaryText().includes('%'), summaryText())
 
   }
 

@@ -70,11 +70,22 @@ function check(label, condition, detail = '') {
 // ── stub gateway ────────────────────────────────────────────────────────────
 
 const received = []
+// Synthetic keys only: drive account refusals through the installed host.
+const refusedKeys = new Map()
+const servedAccounts = []
 const gateway = createServer(async (request, response) => {
   const chunks = []
   for await (const chunk of request) chunks.push(chunk)
   const body = chunks.length === 0 ? {} : JSON.parse(Buffer.concat(chunks).toString('utf8'))
   received.push(body)
+  const accountKey = request.headers.authorization?.replace(/^Bearer /, '')
+  servedAccounts.push(accountKey)
+  const refusal = refusedKeys.get(accountKey)
+  if (refusal !== undefined) {
+    response.writeHead(refusal.status, { 'Content-Type': 'application/json' })
+    response.end(JSON.stringify({ error: { message: refusal.message } }))
+    return
+  }
   const only = body?.providerOptions?.gateway?.only ?? body?.provider?.only ?? null
   const order = body?.providerOptions?.gateway?.order ?? body?.provider?.order ?? null
   const upstream = only?.[0] ?? order?.[0] ?? 'alibaba'
@@ -488,6 +499,44 @@ try {
 
   const unknownResponse = await panelPost(envelope('nope'), cookie)
   check('an unknown action is a typed failure over the wire', unknownResponse.status === 200 && unknownResponse.json?.ok === false, `HTTP ${unknownResponse.status} — ${unknownResponse.text.slice(0, 120)}`)
+
+  // Account refusal must work independently of the channel count, and the
+  // cooldown must consume the installed host's actual quota error constant.
+  await panelPost(envelope('model.pin', { model: 'cline-pass/glm-5.2', upstreams: ['alibaba'], pinMode: 'strict' }), cookie)
+  const backupKey = 'sk_mount_backup_key'
+  await panelPost(envelope('account.add', { name: 'backup', key: backupKey }), cookie)
+  const verifyAccountFailover = async (name, key, mode, refusal) => {
+    await panelPost(envelope('account.add', { name, key }), cookie)
+    // Each case has a fresh pair, so cooldowns from earlier refusals cannot
+    // conceal a broken round-robin path or make it choose an untested key.
+    for (const account of await readAccounts()) {
+      const enabled = await panelPost(envelope('account.enable', { name: account.key, enabled: account.key === name || account.key === 'backup' }), cookie)
+      if (enabled.json?.ok !== true) throw new Error(`account.enable failed: ${enabled.text}`)
+    }
+    await panelPost(envelope('account.mode', { mode, active: name }), cookie)
+    if (mode === 'roundrobin' && await readEffective() !== name) {
+      for await (const chunk of llm.stream({ provider: 'cline-pass', model: 'cline-pass/glm-5.2', messages: [userMessage('align cursor')] })) { /* drain */ }
+    }
+    check(`${mode}: the refusal case starts on the intended account`, await readEffective() === name, await readEffective())
+    refusedKeys.set(key, refusal)
+    const start = servedAccounts.length
+    let answered = false
+    for await (const chunk of llm.stream({ provider: 'cline-pass', model: 'cline-pass/glm-5.2', messages: [userMessage('account failover')] })) {
+      if (chunk.type === 'text-delta') answered = true
+    }
+    const used = servedAccounts.slice(start)
+    check(`${mode}: an account refusal is absorbed by the backup`, answered && used.includes(backupKey), used.join(' -> '))
+    check(`${mode}: the exhausted key is not retried on another channel`, used.filter((value) => value === key).length === 1, used.join(' -> '))
+    check(`${mode}: the panel follows the backup after cooldown`, await readEffective() === 'backup', await readEffective())
+    const nextStart = servedAccounts.length
+    for await (const chunk of llm.stream({ provider: 'cline-pass', model: 'cline-pass/glm-5.2', messages: [userMessage('cooldown')] })) { /* drain */ }
+    check(`${mode}: later requests skip the cooling account`, JSON.stringify(servedAccounts.slice(nextStart)) === JSON.stringify([backupKey]), servedAccounts.slice(nextStart).join(' -> '))
+    const history = (await panelPost(envelope('history'), cookie)).json?.value?.entries ?? []
+    check(`${mode}: history retains the refused account and original error`, history.some((row) => row.account === name && row.error?.includes(refusal.message)), JSON.stringify(history.map((row) => ({ account: row.account, error: row.error }))))
+  }
+  await verifyAccountFailover('spent-weekly', 'sk_mount_spent_weekly', 'single', { status: 429, message: 'Weekly limit reached' })
+  await verifyAccountFailover('spent-five-hour', 'sk_mount_spent_five_hour', 'roundrobin', { status: 429, message: 'five_hour window exhausted' })
+  await verifyAccountFailover('spent-payment', 'sk_mount_spent_payment', 'single', { status: 402, message: 'Payment required' })
 } catch (error) {
   failures.push(`unexpected failure — ${error?.stack ?? error}`)
 } finally {
