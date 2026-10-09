@@ -90,7 +90,7 @@ The provider route and the setup panel are unaffected — the panel is a browser
 
 ## Upstream channels
 
-For a new model, click **Auto-configure** in the panel to probe, validate, and configure channels. Expand a model row to adjust channel order or exclude a channel.
+For a new model, expand its row and click **Probe** to discover channels, then **Validate** to check which channels actually honor a pin. Choose a channel order or exclusions as needed. Validation sends one real request per channel and does not change the stored pin; **Test** checks the saved pin rules.
 
 You can also run the tools in this order:
 

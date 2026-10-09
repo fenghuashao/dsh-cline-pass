@@ -75,10 +75,13 @@ function renderNode(node, depth = 0) {
  * captured so a test can assert it does not throw on its own). This is enough
  * to execute every branch a first render takes.
  */
-function runComponent(component, props) {
+function runComponent(component, props, persistent) {
   const effects = []
   let cursor = 0
-  const slots = []
+  // `persistent` carries hook state across renders, which is what a second render
+  // after an effect set state has to see. Without it every render starts blank and
+  // a component that fetches in an effect can never show its result.
+  const slots = persistent ?? []
   const React = {
     createElement,
     Fragment: Symbol('Fragment'),
@@ -91,6 +94,9 @@ function runComponent(component, props) {
     useMemo(factory) { cursor += 1; return factory() },
     useRef(initial) { cursor += 1; return { current: initial } },
     useCallback(callback) { cursor += 1; return callback },
+    // The pill subscribes to the model-selection store through this, so the
+    // stub has to read the snapshot rather than returning a constant.
+    useSyncExternalStore(subscribe, getSnapshot) { return getSnapshot() },
   }
   const tree = renderNode(component({ ...props, React }))
   return { tree, effects }
@@ -107,6 +113,12 @@ const documentStub = {
   head: { appendChild() {} },
   createElement: () => ({ dataset: {}, textContent: '', setAttribute() {} }),
   querySelector: () => null,
+  // The usage pill skips a poll in a hidden tab and refreshes when the tab comes
+  // back, so it registers and removes a visibility listener. A stub without
+  // these throws from an effect — after paint, outside any render assertion.
+  visibilityState: 'visible',
+  addEventListener() {},
+  removeEventListener() {},
 }
 
 const windowStub = {
@@ -152,6 +164,12 @@ const primitivesStub = {
 const collectedEffects = []
 
 function makeRequire(primitives = primitivesStub, react = undefined) {
+  // This table belongs to the caller that gets it back, so its hook state is its
+  // own. The blocks that render a component to completion pass their own table
+  // (with a cursor they can restart); this one only serves the registrations the
+  // module-scope `apply()` records, whose bodies are never rendered here.
+  const ownHooks = []
+  let ownCursor = 0
   const React = react ?? {
     createElement,
     Fragment: Symbol('Fragment'),
@@ -160,8 +178,12 @@ function makeRequire(primitives = primitivesStub, react = undefined) {
     // bodies are part of the rendered tree — a collapsed card renders its
     // header alone, and the copy asserted below lives in the body.
     useState: (initial) => {
-      const value = typeof initial === 'function' ? initial() : initial
-      return [value === false ? true : value, () => {}]
+      const index = ownCursor++
+      if (!(index in ownHooks)) {
+        const value = typeof initial === 'function' ? initial() : initial
+        ownHooks[index] = value === false ? true : value
+      }
+      return [ownHooks[index], (next) => { ownHooks[index] = typeof next === 'function' ? next(ownHooks[index]) : next }]
     },
     // Effects are where the panel reaches for its actions, and they run after
     // the first paint — outside every error boundary the render assertions
@@ -170,7 +192,12 @@ function makeRequire(primitives = primitivesStub, react = undefined) {
     // takes the whole panel down without failing any render assertion.
     useEffect: (callback) => { collectedEffects.push(callback) },
     useMemo: (factory) => factory(),
-    useRef: () => ({ current: undefined }),
+    useRef: (initial) => ({ current: initial }),
+    // The bundle reads `React.useSyncExternalStore` from this table (not from a
+    // prop), so the usage pill's subscription has to be served here. It reads the
+    // snapshot, which is what lets a test move the selection and re-render.
+    useSyncExternalStore: (subscribe, getSnapshot) => getSnapshot(),
+    useCallback: (callback) => callback,
   }
   return (specifier) => {
     if (specifier === 'react') return React
@@ -211,6 +238,21 @@ try {
 }
 
 check('the bundle requires nothing outside the platform seed', missingRequires.length === 0, missingRequires.join(','))
+
+// A duplicate key in a dictionary is silently the LAST one: the earlier value is
+// overwritten, so a new key that collides with an existing one breaks whatever
+// already used it, with nothing failing at load. This is how the usage pill's
+// heading broke the quota card's heading.
+{
+  // `source` is the bundle read at the top of this file.
+  for (const name of ['ZH', 'EN']) {
+    const from = source.indexOf(`const ${name} = {`)
+    const body = source.slice(from, source.indexOf('\n    }', from))
+    const keys = [...body.matchAll(/^\s*([a-zA-Z][A-Za-z0-9]*):/gm)].map((match) => match[1])
+    const duplicates = [...new Set(keys.filter((key, index) => keys.indexOf(key) !== index))]
+    check(`the ${name} dictionary declares no duplicate key`, duplicates.length === 0, duplicates.join(', '))
+  }
+}
 check('the plugin exports apply()', typeof exportsValue?.apply === 'function')
 check('the plugin declares its inject list', Array.isArray(exportsValue?.inject) && exportsValue.inject.length > 0, JSON.stringify(exportsValue?.inject))
 check('the plugin injects slots', exportsValue?.inject?.includes('slots'))
@@ -248,10 +290,27 @@ const connectionService = {
 // through `get()`; the plugin uses both forms. `stubLocale` stays reassignable
 // so the tests below can exercise each locale posture.
 let stubLocale
+/**
+ * The model-selection directory the usage pill reads the selected provider from.
+ *
+ * `session` is captured so a test can move the selection and assert the pill
+ * re-gates; a stub that answered `undefined` would let a pill that never reads
+ * the selection back pass.
+ */
+const stubDirectory = { current: { provider: 'cline-pass', model: 'cline-pass/glm-5.3' } }
+const stubModelDirectories = {
+  directoryFor: () => ({
+    store: {
+      getSnapshot: () => stubDirectory,
+      subscribe: () => () => {},
+    },
+  }),
+}
 const stubCtx = {
   logger: { info() {}, warn() {}, error() {} },
   slots: slotsService,
   connection: connectionService,
+  modelDirectories: stubModelDirectories,
   effect(body) {
     const dispose = body()
     return typeof dispose === 'function' ? dispose : () => {}
@@ -260,6 +319,7 @@ const stubCtx = {
     if (name === 'slots') return slotsService
     if (name === 'connection') return connectionService
     if (name === 'locale') return stubLocale
+    if (name === 'modelDirectories') return stubModelDirectories
     return undefined
   },
 }
@@ -272,8 +332,34 @@ try {
 }
 check('apply() runs without throwing', applyError === null, applyError?.message ?? '')
 
+// Current Cordis executes service methods in the consumer's context. Model
+// directories need remote.session; legacy hosts lack that service entirely.
+{
+  const modernRegistrations = []
+  const scopes = []
+  const modernSlots = { ...slotsService, register(options, component) { modernRegistrations.push({ options, component }); return () => {} } }
+  const modernCtx = {
+    ...stubCtx,
+    slots: modernSlots,
+    modelDirectories: { directoryFor() { throw new Error('remote.session was not injected into this context') } },
+    get(name) { if (name === 'remote.session') return {}; if (name === 'slots') return modernSlots; return stubCtx.get(name) },
+    inject(dependencies, callback) {
+      scopes.push(dependencies)
+      return callback({ ...this, modelDirectories: stubModelDirectories })
+    },
+  }
+  exportsValue.apply(modernCtx)
+  const usage = modernRegistrations.find((r) => r.options.name === 'conversation.input.right')
+  let injected
+  let failure
+  try { injected = usage.options.inject('modern-session') } catch (error) { failure = error }
+  check('modern usage slot gets a context with remote.session', failure === undefined, failure?.message)
+  check('modern usage slot receives the actual model selection store', injected?.directory?.getSnapshot() === stubDirectory)
+  check('only the modern host path adds the remote.session dependency', scopes.length === 1 && scopes[0].includes('remote.session'))
+}
+
 const keys = registrations.map((registration) => `${registration.options.name}:${registration.options.key ?? registration.options.id ?? ''}`)
-check('every declared slot is registered', registrations.length === 2, keys.join(' '))
+check('every declared slot is registered', registrations.length === 3, keys.join(' '))
 check('a Plugins tab is registered', registrations.some((registration) => registration.options.name === 'settings.plugins.tab' && registration.options.id === 'cline-pass'), keys.join(' '))
 check('a Models-page card is registered', registrations.some((registration) => registration.options.name === 'settings.models.provider-card' && registration.options.key === 'cline-pass'), keys.join(' '))
 // `settings.plugins.tab` is a list slot ordered by `order`; the host's own
@@ -527,9 +613,12 @@ check('a composition without the locale service still renders Chinese', renderCa
 // ── call every registered component ─────────────────────────────────────────
 
 /** Build the props a slot hands a component: the injected face plus hooks. */
-function propsFor(registration) {
+function propsFor(registration, sessionId) {
+  // A session-scoped slot's `inject` is called with the session it renders for;
+  // calling it with nothing would hand the component a different directory than
+  // the one a test mutates, and the gate would pass for the wrong reason.
   const face = typeof registration.options.inject === 'function'
-    ? (Array.isArray(registration.options.inject) ? registration.options.inject() : registration.options.inject())
+    ? registration.options.inject(sessionId)
     : {}
   const injected = face?.hooks === undefined
     ? face
@@ -625,11 +714,17 @@ function renderWith(primitives, registration) {
     logger: { info() {}, warn() {}, error() {} },
     slots,
     connection: connectionService,
+    modelDirectories: { directoryFor: () => ({ store: { getSnapshot: () => ({ current: null }), subscribe: () => () => {} } }) },
     effect: (body) => {
       const dispose = body()
       return typeof dispose === 'function' ? dispose : () => {}
     },
-    get: (name) => (name === 'slots' ? slots : name === 'connection' ? connectionService : undefined),
+    get(name) {
+      if (name === 'slots') return slots
+      if (name === 'connection') return connectionService
+      if (name === 'modelDirectories') return this.modelDirectories
+      return undefined
+    },
   }
   exportsUnderTest.apply(ctx)
   const target = seen.find((entry) => entry.options.name === registration)
@@ -684,21 +779,32 @@ for (const [label, names, expected] of [
 {
   const hooks = []
   let cursor = 0
+  // The settings panel's cards fold on a boolean and the copy under test lives in
+  // the body, so its `false` states are opened. The usage pill's booleans are
+  // data and interaction state — coercing those renders its failure posture and
+  // an already-expanded card — so it renders with this off.
+  let coerced = true
   const React = {
     createElement,
     Fragment: Symbol('Fragment'),
     useState(initial) {
       const index = cursor++
       if (!(index in hooks)) hooks[index] = typeof initial === 'function' ? initial() : initial
-      // A boolean in this panel is a disclosure, and the card under test is the
-      // folded body one guards.
-      if (hooks[index] === false) hooks[index] = true
+      // A boolean in the settings panel is a disclosure, and the card under test
+      // is the folded body one guards. The usage pill's booleans are failure and
+      // disclosure flags read from data, so coercing those would make it render
+      // its failed posture instead of its reading.
+      if (hooks[index] === false && coerced) hooks[index] = true
       return [hooks[index], (next) => { hooks[index] = typeof next === 'function' ? next(hooks[index]) : next }]
     },
     useEffect(callback) { collectedEffects.push(callback) },
     useMemo(factory) { cursor += 1; return factory() },
     useRef(initial) { cursor += 1; return { current: initial } },
     useCallback(callback) { cursor += 1; return callback },
+    // The usage pill learns the selected provider through this. Reading the
+    // snapshot (rather than a constant) is what lets a test move the selection
+    // and assert the pill re-gates.
+    useSyncExternalStore(subscribe, getSnapshot) { return getSnapshot() },
   }
   const load = []
   const win = { __ModuleLoader__: { load: (entry) => load.push(entry) }, document: documentStub }
@@ -712,6 +818,33 @@ for (const [label, names, expected] of [
     else globalThis.window = previousWindow
   }
   const seen = []
+  /**
+   * A model-selection directory stand-in.
+   *
+   * The usage pill subscribes to this to learn the selected provider, so the
+   * store has to behave like the real one: a snapshot plus a subscribe that
+   * fires on change. A stub that only exposed the current value would let a pill
+   * that never re-gates on a model switch pass.
+   */
+  const makeDirectory = (initial = { current: null }) => {
+    let snapshot = initial
+    const listeners = new Set()
+    return {
+      store: {
+        getSnapshot: () => snapshot,
+        subscribe: (listener) => { listeners.add(listener); return () => listeners.delete(listener) },
+      },
+      set: (next) => { snapshot = next; listeners.forEach((listener) => listener()) },
+    }
+  }
+  const directories = new Map()
+  const modelDirectories = {
+    directoryFor: (sessionId) => {
+      if (!directories.has(sessionId)) directories.set(sessionId, makeDirectory())
+      return directories.get(sessionId)
+    },
+  }
+
   const slots = {
     inject: (key, callback) => { callback(); return () => {} },
     register: (options, component) => { seen.push({ options, component }); return () => {} },
@@ -720,8 +853,9 @@ for (const [label, names, expected] of [
     logger: { info() {}, warn() {}, error() {} },
     slots,
     connection: connectionService,
+    modelDirectories,
     effect: (body) => { const dispose = body(); return typeof dispose === 'function' ? dispose : () => {} },
-    get: (name) => (name === 'slots' ? slots : name === 'connection' ? connectionService : undefined),
+    get: (name) => (name === 'slots' ? slots : name === 'connection' ? connectionService : name === 'modelDirectories' ? modelDirectories : undefined),
   })
   const card = seen.find((entry) => entry.options.name === 'settings.plugins.tab').component
   const cardProps = propsFor(seen.find((entry) => entry.options.name === 'settings.plugins.tab'))
@@ -751,6 +885,10 @@ for (const [label, names, expected] of [
     status: 'ready',
     data: {
       provider: 'cline-pass', ready: true, settingsAvailable: true, accountMode: mode, activeAccount: active,
+      // The host resolves which account a request would use. The stub mirrors it:
+      // single mode honours `activeAccount`, and a pool without a cursor takes the
+      // first enabled one.
+      effectiveAccount: active !== '' ? active : (accounts[0] ?? ''),
       accounts: accounts.map((key) => ({ key, enabled: true, declared: true })),
       models: [], pinnedModels: 0, hiddenModels: 0, catalogCount: 0, historySize: 0,
       usage: { fetchedAt: Date.now(), accounts: accounts.map((key, index) => reading(key, [11, 22, 33][index] ?? 44, key !== 'b')) },
@@ -772,22 +910,46 @@ for (const [label, names, expected] of [
     return true
   }
 
+  // The card opens on the account a request would use, which is the reading the
+  // pool was opened for. The first entry is not it: usage is per account, so
+  // starting there answers a question about a key that may not be about to be used.
   show(['a', 'b', 'c'], 'single', 'b')
   let view = copy(render())
-  check('the quota card shows one account at a time', view.includes('名字 a') && !view.includes('名字 b') && !view.includes('名字 c'), quota(view).slice(0, 120))
-  check('the quota card shows which account of how many', view.includes('1 / 3'), quota(view).slice(0, 120))
+  check('the quota card opens on the account a request would use',
+    view.includes('名字 b') && !view.includes('名字 a') && !view.includes('名字 c'), quota(view).slice(0, 120))
+  check('the quota card shows which account of how many', view.includes('2 / 3'), quota(view).slice(0, 120))
+  // The account in line is shown even when its own read failed, rather than a
+  // healthy reading borrowed from an account the request will not touch.
+  check('an account whose read failed still shows its own error', view.includes('读不到'), quota(view).slice(0, 160))
+
+  show(['a'], 'single', 'new-account')
+  const missingReading = quota(copy(render()))
+  check('the quota card never borrows a reading for an account absent from its cache',
+    !missingReading.includes('11%') && missingReading.includes('账号 new-account'), missingReading)
+  const missingState = store.getSnapshot()
+  store.set({ ...missingState, data: { ...missingState.data, effectiveAccount: '' } })
+  const disabledReading = quota(copy(render()))
+  check('the quota card does not show cached quota when no account is effective',
+    !disabledReading.includes('11%') && disabledReading.includes('暂时读不到'), disabledReading)
+  store.set({ ...missingState, data: { ...missingState.data, effectiveAccount: undefined } })
+  check('the quota card still supports a host without effectiveAccount', quota(copy(render())).includes('11%'))
+  show(['a', 'b', 'c'], 'single', 'b')
 
   check('the quota card offers a next-account control', click(next), 'no button')
   view = copy(render())
-  check('next moves to the second account', view.includes('名字 b'), quota(view).slice(0, 120))
-  check('an account whose read failed still shows its own error', view.includes('读不到'), quota(view).slice(0, 160))
-  click(next); view = copy(render())
-  check('next moves to the third account', view.includes('名字 c') && view.includes('3 / 3'), quota(view).slice(0, 120))
+  check('next moves to the following account', view.includes('名字 c') && view.includes('3 / 3'), quota(view).slice(0, 120))
   click(next); view = copy(render())
   check('next wraps back to the first account', view.includes('名字 a') && view.includes('1 / 3'), quota(view).slice(0, 120))
   check('the quota card offers a previous-account control', click(prev), 'no button')
   view = copy(render())
   check('previous wraps backwards to the last account', view.includes('名字 c') && view.includes('3 / 3'), quota(view).slice(0, 120))
+
+  // Paging is the user's: the account in line moving underneath must not yank the
+  // card off the account they are reading.
+  show(['a', 'b', 'c'], 'single', 'a')
+  view = copy(render())
+  check('a paged card keeps the page the user chose',
+    view.includes('名字 c') && view.includes('3 / 3'), quota(view).slice(0, 120))
 
   // Removing accounts shortens the reading under a selection that is now past
   // its end; the card must clamp rather than index off the list.
@@ -827,6 +989,331 @@ for (const [label, names, expected] of [
   check('round-robin shows no current badge', !quota(copy(render())).includes('当前'), quota(copy(render())).slice(0, 120))
   // An empty `activeAccount` means "first enabled", not "none".
   check('an empty activeAccount resolves to the first enabled account', JSON.stringify(badgeOn('single', '')) === JSON.stringify(['名字 a']), JSON.stringify(badgeOn('single', '')))
+
+  // ── the usage pill beside the model selector ────────────────────────────────
+  //
+  // The pill is the only surface that reads the model selection, and the gate is
+  // the whole reason it exists: a pill that polled the gateway for every model
+  // would spend a request per conversation. Both postures are asserted, plus the
+  // reading itself, so neither the gate nor the rendering can regress silently.
+  {
+    const pillEntry = seen.find((entry) => entry.options.name === 'conversation.input.right')
+    const pillProps = propsFor(pillEntry, 'pill-session')
+    // The shared stub answers state without a reading, so the pill would render
+    // its empty posture. Give this one the shape the host actually returns for
+    // `usage`, so the assertions below are about the rendering and not about a
+    // stub that never carried the data.
+    const pillLimits = [
+      { type: 'five_hour', percentUsed: 6, resetsAt: new Date(Date.now() + 3_600_000).toISOString() },
+      { type: 'weekly', percentUsed: 2, resetsAt: new Date(Date.now() + 86_400_000).toISOString() },
+      { type: 'monthly', percentUsed: 48, resetsAt: new Date(Date.now() + 172_800_000).toISOString() },
+    ]
+    /**
+     * Stand in for the host's `usage` reply.
+     *
+     * The real read also lands its result in the panel's snapshot, and the pill
+     * takes the effective account from there — a switch updates that snapshot at
+     * once while a reading only arrives on a timer. A stub that only returned the
+     * payload would leave the store naming an account this test never set.
+     */
+    const replyUsage = (payload) => {
+      pillProps.readUsage = async () => {
+        const state = store.getSnapshot()
+        store.set({ ...state, status: 'ready', data: { ...state.data, ...payload } })
+        return payload
+      }
+    }
+    replyUsage({
+      effectiveAccount: 'default',
+      usage: { fetchedAt: Date.now(), accounts: [{ account: 'default', displayName: 'Cline Pass', ok: true, limits: pillLimits }] },
+    })
+    /**
+     * Render the pill with its effects run, the way the host does.
+     *
+     * The reading arrives from the RPC inside an effect — the panel's own tests
+     * had to do this for the same reason — so a render without running them only
+     * ever shows the pre-fetch state.
+     */
+    /**
+     * Render the pill the way the shell does: one pass, run its effects, then a
+     * second pass that sees the state those effects set. The bundle-level React
+     * table owns that state, so it is reset per render pass here.
+     */
+    const pillText = async () => {
+      // The component reads React from the bundle's own `require('react')`, whose
+      // table is this block's `hooks`/`cursor` — not the one `runComponent`
+      // returns. Hook state is kept across the two passes so the reading the
+      // effect set survives; the cursor restarts so the second pass reads the
+      // same slots the first one wrote.
+      hooks.length = 0
+      cursor = 0
+      collectedEffects.length = 0
+      coerced = false
+      try {
+        runComponent(pillEntry.component, { ...pillProps })
+      } finally {
+        coerced = true
+      }
+      // The effect arms a 60s interval. Its cleanup is what stops that timer, so
+      // it has to be called or the process never exits — and the timer is the
+      // same one that would keep polling a mounted pill.
+      const cleanups = []
+      for (const effect of collectedEffects) {
+        const dispose = effect()
+        if (typeof dispose === 'function') cleanups.push(dispose)
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      for (const dispose of cleanups) dispose()
+      cursor = 0
+      coerced = false
+      let second
+      try {
+        second = runComponent(pillEntry.component, { ...pillProps })
+      } finally {
+        coerced = true
+      }
+      cursor = 0
+      return collectText(resolveComponents(second.tree)).join(' ')
+    }
+    // The same session the props were built for, so the store the pill
+    // subscribes to is the one this test moves.
+    const sessionId = 'pill-session'
+    const directory = modelDirectories.directoryFor(sessionId)
+
+    // Another provider's model selected: the pill must render nothing at all.
+    directory.set({ current: { provider: 'deepseek', model: 'deepseek-v4.1-flash' } })
+    check('the usage pill is absent under another provider', (await pillText()) === '', (await pillText()).slice(0, 80))
+
+    // This provider selected: the pill renders its reading.
+    directory.set({ current: { provider: 'cline-pass', model: 'cline-pass/glm-5.3' } })
+    const shown = await pillText()
+    check('the usage pill renders under this provider', shown.includes('Pass'), shown.slice(0, 160))
+    // The collapsed button's OWN text, found by its class. Asserting against the
+    // whole rendered tree would pass even if the summary lost a window, because
+    // the expanded card names the same windows.
+    const summaryText = () => {
+      // Keep the hook state the fetch wrote (so the reading is on screen); only
+      // restart the cursor, which is what makes this pass read the same slots.
+      cursor = 0
+      coerced = false
+      let tree
+      try {
+        tree = runComponent(pillEntry.component, { ...pillProps }).tree
+      } finally {
+        coerced = true
+      }
+      cursor = 0
+      let found = null
+      const walk = (node) => {
+        if (node === null || node === undefined || typeof node !== 'object' || found !== null) return
+        if (Array.isArray(node)) { node.forEach(walk); return }
+        if (node.props?.className === 'cp-pill-btn') { found = node; return }
+        walk(node.children)
+      }
+      walk(tree)
+      return found === null ? '' : collectText({ ...found, children: found.children }).join('')
+    }
+    // Populate the reading the way the host does, then read the button alone.
+    await pillText()
+    const collapsed = summaryText()
+    check('the collapsed pill summarises the five-hour and weekly windows',
+      collapsed.includes('5 小时 6%') && collapsed.includes('周 2%'), JSON.stringify(collapsed))
+    // `chargeUsage` is what the injected face hands the component; the first
+    // paint must not have called it, because the effect only runs when the host
+    // runs effects and the pill is asserted here before that.
+    check('the pill follows the selection rather than a captured value',
+      typeof pillEntry.options.inject === 'function' && typeof pillEntry.options.inject(sessionId).route === 'function')
+
+    // The reported bug: with a pool the pill showed the first account that
+    // answered rather than the one a request would spend. Quota is per account,
+    // so a healthy reading from the wrong key is worse than none — it answers a
+    // question about a key that is not about to be used.
+    const at = (hours) => new Date(Date.now() + hours * 3_600_000).toISOString()
+    /** Two accounts with distinguishable readings, and the host's pick. */
+    const poolOf = (effectiveAccount) => ({
+      effectiveAccount,
+      usage: {
+        fetchedAt: Date.now(),
+        accounts: [
+          { account: 'primary', displayName: 'Primary', ok: true, limits: [
+            { type: 'five_hour', percentUsed: 11, resetsAt: at(1) },
+            { type: 'weekly', percentUsed: 22, resetsAt: at(24) },
+          ] },
+          { account: 'backup', displayName: 'Backup', ok: true, limits: [
+            { type: 'five_hour', percentUsed: 66, resetsAt: at(1) },
+            { type: 'weekly', percentUsed: 77, resetsAt: at(24) },
+          ] },
+        ],
+      },
+    })
+    replyUsage(poolOf('backup'))
+    await pillText()
+    const pooled = summaryText()
+    check('the pill reads the account a request would use, not the first that answered',
+      pooled.includes('66%') && pooled.includes('77%') && !pooled.includes('11%'),
+      JSON.stringify(pooled))
+
+    // A pool whose effective account has no readable quota must say so rather
+    // than fall back to a healthy account the request will not touch.
+    replyUsage({
+      effectiveAccount: 'broken',
+      usage: {
+        fetchedAt: Date.now(),
+        accounts: [
+          { account: 'primary', displayName: 'Primary', ok: true, limits: [
+            { type: 'five_hour', percentUsed: 11, resetsAt: at(1) },
+          ] },
+          { account: 'broken', displayName: 'Broken', ok: false, limits: [], error: 'no API key stored for broken' },
+        ],
+      },
+    })
+    await pillText()
+    const brokenPool = summaryText()
+    check('the pill does not substitute a different account when the effective one cannot be read',
+      !brokenPool.includes('11%'), JSON.stringify(brokenPool))
+
+    replyUsage(poolOf('new-account'))
+    await pillText()
+    check('the pill never borrows quota when the effective account is absent from its cache',
+      !summaryText().includes('%'), summaryText())
+    replyUsage(poolOf(''))
+    await pillText()
+    check('the pill clears cached percentages when no account is effective',
+      !summaryText().includes('%'), summaryText())
+    replyUsage(poolOf(undefined))
+    await pillText()
+    check('the pill still supports a host without effectiveAccount',
+      summaryText().includes('11%'), summaryText())
+
+    // ── the popover moves between accounts ──────────────────────────────────
+    //
+    // Quota is per account, so a pool is reviewed one at a time — the same
+    // behaviour the settings card has. Without this the pill could only ever show
+    // whichever account the host named, and a pool's other accounts were
+    // unreachable from the model selector entirely.
+    replyUsage(poolOf('primary'))
+    /** One render pass, keeping the hook state the previous pass wrote. */
+    const pillTree = () => {
+      cursor = 0
+      coerced = false
+      let tree
+      try {
+        tree = runComponent(pillEntry.component, { ...pillProps }).tree
+      } finally {
+        coerced = true
+      }
+      cursor = 0
+      return tree
+    }
+    const findIn = (tree, match) => {
+      let found = null
+      const walk = (node) => {
+        if (node === null || node === undefined || typeof node !== 'object' || found !== null) return
+        if (Array.isArray(node)) { node.forEach(walk); return }
+        if (match(node)) { found = node; return }
+        walk(node.children)
+      }
+      walk(tree)
+      return found
+    }
+    const pillText2 = () => collectText(resolveComponents(pillTree())).join(' ')
+
+    await pillText()
+    // Open it the way a user does, rather than by forcing the disclosure state.
+    const opener = findIn(pillTree(), (node) => node.props?.className === 'cp-pill-btn')
+    check('the pill offers a disclosure control', opener !== null && typeof opener.props?.onClick === 'function')
+    opener?.props?.onClick?.()
+
+    const firstPage = pillText2()
+    check('the popover opens on the account a request would use',
+      firstPage.includes('Primary') && firstPage.includes('1 / 2') && firstPage.includes('11%'),
+      firstPage.slice(0, 200))
+
+    const arrow = (label) => findIn(pillTree(), (node) => node.props?.['aria-label'] === label)
+    const nextArrow = arrow('下一个账号')
+    check('the popover offers a next-account control', nextArrow !== null && typeof nextArrow.props?.onClick === 'function')
+    // Guarded: a missing control must fail its own check rather than throw and
+    // hide every assertion after it.
+    nextArrow?.props?.onClick?.()
+    const secondPage = pillText2()
+    check('the popover moves to the next account',
+      secondPage.includes('Backup') && secondPage.includes('2 / 2') && secondPage.includes('66%'),
+      secondPage.slice(0, 200))
+
+    // The account a request would use moving underneath must not yank the reading
+    // off the page the user chose: the host still names `primary`, and the popover
+    // has to stay on the account the user turned to.
+    const held = pillText2()
+    check('a paged popover keeps the page the user chose',
+      held.includes('Backup') && held.includes('2 / 2') && held.includes('66%') && !held.includes('Primary'),
+      held.slice(0, 200))
+
+    // ── the popover follows an account switched elsewhere ───────────────────
+    //
+    // Switching accounts is a panel action: it lands in the shared snapshot at
+    // once, whereas a usage reading only arrives on mount and on a timer. Taking
+    // the account from the reading is what left the popover naming the previous
+    // account after the settings card had already moved.
+    replyUsage(poolOf('primary'))
+    await pillText()
+    findIn(pillTree(), (node) => node.props?.className === 'cp-pill-btn')?.props?.onClick?.()
+    check('the popover opens on the account the host named',
+      pillText2().includes('Primary'), pillText2().slice(0, 160))
+
+    // The settings page switches accounts. No usage read is taken here: the point
+    // is that the snapshot alone has to carry it.
+    const switchedFrom = store.getSnapshot()
+    store.set({ ...switchedFrom, data: { ...switchedFrom.data, effectiveAccount: 'backup' } })
+    const switched = pillText2()
+    check('the popover follows an account switched in the settings page',
+      switched.includes('Backup') && switched.includes('66%') && !switched.includes('Primary'),
+      switched.slice(0, 200))
+
+    // Closing forgets the page, so reopening after a switch shows the account a
+    // request would use rather than the page left behind.
+    replyUsage(poolOf('primary'))
+    await pillText()
+    const clickPill = () => findIn(pillTree(), (node) => node.props?.className === 'cp-pill-btn')?.props?.onClick?.()
+    /** Run the effects a render registered, the way the host does after paint. */
+    const runEffects = async () => {
+      collectedEffects.length = 0
+      pillTree()
+      const cleanups = []
+      for (const effect of collectedEffects) {
+        const dispose = effect()
+        if (typeof dispose === 'function') cleanups.push(dispose)
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      for (const dispose of cleanups) dispose()
+    }
+    clickPill()
+    findIn(pillTree(), (node) => node.props?.['aria-label'] === '下一个账号')?.props?.onClick?.()
+    check('the popover can be moved before it is closed',
+      pillText2().includes('Backup') && pillText2().includes('2 / 2'), pillText2().slice(0, 160))
+    clickPill()
+    await runEffects()
+    clickPill()
+    const reopened = pillText2()
+    check('reopening returns to the account a request would use',
+      reopened.includes('Primary') && reopened.includes('1 / 2') && !reopened.includes('Backup'),
+      reopened.slice(0, 200))
+
+    // A setting change arrives before the next usage poll. Even if that poll
+    // fails, the retained successful cache belongs to the old account.
+    const cachedState = store.getSnapshot()
+    store.set({ ...cachedState, data: { ...cachedState.data, effectiveAccount: 'new-account' } })
+    check('a panel-only account switch immediately clears unrelated cached percentages',
+      !summaryText().includes('%'), summaryText())
+    pillProps.readUsage = async () => { throw new Error('usage unavailable') }
+    await runEffects()
+    const failedRefresh = pillText2()
+    check('a failed usage poll cannot restore a different account\'s cached quota',
+      !summaryText().includes('%') && failedRefresh.includes('用量不可用') && !failedRefresh.includes('Primary'), failedRefresh)
+    store.set({ ...cachedState, data: { ...cachedState.data, effectiveAccount: '' } })
+    check('disabling all accounts clears retained quota even after a failed poll',
+      !summaryText().includes('%'), summaryText())
+
+  }
 
   store.set(snapshot)
 }

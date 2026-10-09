@@ -70,11 +70,22 @@ function check(label, condition, detail = '') {
 // ── stub gateway ────────────────────────────────────────────────────────────
 
 const received = []
+// Synthetic keys only: drive account refusals through the installed host.
+const refusedKeys = new Map()
+const servedAccounts = []
 const gateway = createServer(async (request, response) => {
   const chunks = []
   for await (const chunk of request) chunks.push(chunk)
   const body = chunks.length === 0 ? {} : JSON.parse(Buffer.concat(chunks).toString('utf8'))
   received.push(body)
+  const accountKey = request.headers.authorization?.replace(/^Bearer /, '')
+  servedAccounts.push(accountKey)
+  const refusal = refusedKeys.get(accountKey)
+  if (refusal !== undefined) {
+    response.writeHead(refusal.status, { 'Content-Type': 'application/json' })
+    response.end(refusal.raw ?? JSON.stringify({ error: { message: refusal.message } }))
+    return
+  }
   const only = body?.providerOptions?.gateway?.only ?? body?.provider?.only ?? null
   const order = body?.providerOptions?.gateway?.order ?? body?.provider?.order ?? null
   const upstream = only?.[0] ?? order?.[0] ?? 'alibaba'
@@ -258,6 +269,14 @@ try {
   check('a model call streams through the runtime', text === 'served by alibaba', JSON.stringify(chunks))
   check('the stream finishes', chunks.at(-1)?.type === 'finish', JSON.stringify(chunks.at(-1)))
   check('the stub received the call with usage requested', received.length === 1 && received[0].stream === true && received[0].stream_options?.include_usage === true, JSON.stringify(received))
+  // The outgoing `max_tokens` is the configured per-request BUDGET, not the model's
+  // published output ceiling. dsh fills it from `defaultMaxTokens` and reserves the
+  // same number as completion room, so sending the ceiling would reserve 131k of this
+  // model's window on every call and compact it well below the threshold ratio.
+  const ceiling = (await import('../lib/catalog.js')).catalogEntry('cline-pass/glm-5.2').maxTokens
+  check('the outgoing request asks for the budget, not the model output ceiling',
+    Number.isInteger(received[0].max_tokens) && received[0].max_tokens < ceiling,
+    `max_tokens=${received[0].max_tokens} ceiling=${ceiling}`)
 
   // A pin written through the settings document must reach the next request.
   const settings = ctx.get('settings')
@@ -302,6 +321,12 @@ try {
   const clientRow = (graph?.entries ?? []).find((row) => row.id === 'dsh-cline-pass')
   check('the browser bundle is served from a revisioned URL', typeof clientRow?.url === 'string' && clientRow.url.includes('rev='), String(clientRow?.url))
   check('the browser bundle declares the plugins it waits for', Array.isArray(clientRow?.inject) && clientRow.inject.includes('@deepseek-ai/dsh-client-connection'), JSON.stringify(clientRow?.inject))
+  // The usage pill reads the selected provider from the model-selection service,
+  // so the bundle has to declare it. Without the declaration the service is
+  // gated and the pill's inject throws — which only shows up in the browser.
+  check('the browser bundle waits for the model-selection service',
+    Array.isArray(clientRow?.inject) && clientRow.inject.includes('@deepseek-ai/dsh-client-ui-model-selection'),
+    JSON.stringify(clientRow?.inject))
 
   // ── the panel route over real HTTP ────────────────────────────────────────
   // A rendered browser half proves nothing about the host route it calls: a
@@ -411,9 +436,59 @@ try {
   const added = await panelPost(envelope('account.add', { name: 'doomed', key: 'sk_doomed_key_123456' }), cookie)
   check('the panel adds a second account', added.json?.ok === true && (await readAccounts()).some((account) => account.key === 'doomed'), `${added.status} — ${JSON.stringify((await readAccounts()).map((a) => a.key))}`)
 
+  // ── the reading follows the account a request would use ───────────────────
+  //
+  // With a pool, `activeAccount` is only the single-mode choice and usage is per
+  // account, so a surface that names the wrong one describes quota that is not
+  // about to be spent. The host has to say which account is in line; the client
+  // cannot work it out, and before this it simply took the first one that read.
+  const chooseAccount = async (active) => {
+    await panelPost(envelope('account.mode', { mode: 'single', active }), cookie)
+    const response = await panelPost(envelope('state'), cookie)
+    return response.json?.value?.effectiveAccount
+  }
+  check('the reading follows the account the pool is pointed at',
+    await chooseAccount('doomed') === 'doomed', `effective=${await chooseAccount('doomed')}`)
+  check('the reading returns to the first enabled account when none is chosen',
+    await chooseAccount('') === 'default', `effective=${await chooseAccount('')}`)
+
+  // The pill takes the account from the `usage` reply, which is this same state
+  // plus a reading, so the field has to travel there too — a client that only
+  // found it on `state` would fall back to its own older copy.
+  const usageReply = await panelPost(envelope('usage'), cookie)
+  check('the usage reply carries the account a request would use',
+    usageReply.json?.value?.effectiveAccount === 'default',
+    JSON.stringify(usageReply.json?.value?.effectiveAccount))
+
+  // In round-robin no single account represents the pool: a request takes the
+  // one the cursor points at and advances it, so a reading pinned to the first
+  // account describes a key that is only sometimes the one being spent.
+  await panelPost(envelope('account.mode', { mode: 'roundrobin', active: '' }), cookie)
+  const readEffective = async () => (await panelPost(envelope('state'), cookie)).json?.value?.effectiveAccount
+  const beforeTurn = await readEffective()
+  let streamed = false
+  try {
+    for await (const chunk of llm.stream({ provider: 'cline-pass', model: 'cline-pass/glm-5.2', messages: [userMessage('advance')] })) {
+      if (chunk.type === 'text-delta') streamed = true
+    }
+  } catch { /* the rotation already moved; the reading is what is under test */ }
+  const afterTurn = await readEffective()
+  check('a pool rotates the reading to the account the next request would use',
+    beforeTurn !== afterTurn && beforeTurn !== '' && afterTurn !== '',
+    `${beforeTurn} -> ${afterTurn} (streamed=${streamed})`)
+  // Reading quota is not a request, so asking must not consume a turn of its own.
+  check('reading the quota does not consume a round-robin turn',
+    await readEffective() === afterTurn, `${afterTurn} -> ${await readEffective()}`)
+  await panelPost(envelope('account.mode', { mode: 'single', active: '' }), cookie)
+
   const removed = await panelPost(envelope('account.remove', { name: 'doomed' }), cookie)
   const remaining = await readAccounts()
   check('a removed account is gone from the state', removed.json?.ok === true && !remaining.some((account) => account.key === 'doomed'), `${removed.status} — ${JSON.stringify(remaining.map((a) => a.key))}`)
+  // The account that was in line is gone, so the reading has to name another one
+  // rather than keep pointing at a key that no longer exists.
+  check('the reading survives the account it named being removed',
+    (await panelPost(envelope('state'), cookie)).json?.value?.effectiveAccount === 'default',
+    JSON.stringify((await panelPost(envelope('state'), cookie)).json?.value?.effectiveAccount))
   // The service is the authority: re-read the document rather than trusting the
   // panel's own projection of it.
   const sideDocuments = [
@@ -429,6 +504,70 @@ try {
 
   const unknownResponse = await panelPost(envelope('nope'), cookie)
   check('an unknown action is a typed failure over the wire', unknownResponse.status === 200 && unknownResponse.json?.ok === false, `HTTP ${unknownResponse.status} — ${unknownResponse.text.slice(0, 120)}`)
+
+  // Account refusal must work independently of the channel count, and the
+  // cooldown must consume the installed host's actual quota error constant.
+  await panelPost(envelope('model.pin', { model: 'cline-pass/glm-5.2', upstreams: ['alibaba'], pinMode: 'strict' }), cookie)
+  const backupKey = 'sk_mount_backup_key'
+  await panelPost(envelope('account.add', { name: 'backup', key: backupKey }), cookie)
+  const verifyAccountFailover = async (name, key, mode, refusal) => {
+    await panelPost(envelope('account.add', { name, key }), cookie)
+    // Each case has a fresh pair, so cooldowns from earlier refusals cannot
+    // conceal a broken round-robin path or make it choose an untested key.
+    for (const account of await readAccounts()) {
+      const enabled = await panelPost(envelope('account.enable', { name: account.key, enabled: account.key === name || account.key === 'backup' }), cookie)
+      if (enabled.json?.ok !== true) throw new Error(`account.enable failed: ${enabled.text}`)
+    }
+    await panelPost(envelope('account.mode', { mode, active: name }), cookie)
+    if (mode === 'roundrobin' && await readEffective() !== name) {
+      for await (const chunk of llm.stream({ provider: 'cline-pass', model: 'cline-pass/glm-5.2', messages: [userMessage('align cursor')] })) { /* drain */ }
+    }
+    check(`${mode}: the refusal case starts on the intended account`, await readEffective() === name, await readEffective())
+    refusedKeys.set(key, refusal)
+    const start = servedAccounts.length
+    let answered = false
+    for await (const chunk of llm.stream({ provider: 'cline-pass', model: 'cline-pass/glm-5.2', messages: [userMessage('account failover')] })) {
+      if (chunk.type === 'text-delta') answered = true
+    }
+    const used = servedAccounts.slice(start)
+    check(`${mode}: an account refusal is absorbed by the backup`, answered && used.includes(backupKey), used.join(' -> '))
+    check(`${mode}: the exhausted key is not retried on another channel`, used.filter((value) => value === key).length === 1, used.join(' -> '))
+    check(`${mode}: the panel follows the backup after cooldown`, await readEffective() === 'backup', await readEffective())
+    const nextStart = servedAccounts.length
+    for await (const chunk of llm.stream({ provider: 'cline-pass', model: 'cline-pass/glm-5.2', messages: [userMessage('cooldown')] })) { /* drain */ }
+    check(`${mode}: later requests skip the cooling account`, JSON.stringify(servedAccounts.slice(nextStart)) === JSON.stringify([backupKey]), servedAccounts.slice(nextStart).join(' -> '))
+    const history = (await panelPost(envelope('history'), cookie)).json?.value?.entries ?? []
+    check(`${mode}: history retains the refused account and original error`, history.some((row) => row.account === name && row.error?.includes(refusal.message)), JSON.stringify(history.map((row) => ({ account: row.account, error: row.error }))))
+  }
+  await verifyAccountFailover('spent-weekly', 'sk_mount_spent_weekly', 'single', { status: 429, message: 'Weekly limit reached' })
+  await verifyAccountFailover('spent-five-hour', 'sk_mount_spent_five_hour', 'roundrobin', { status: 429, message: 'five_hour window exhausted' })
+  await verifyAccountFailover('spent-payment', 'sk_mount_spent_payment', 'single', { status: 402, message: 'Payment required' })
+  await verifyAccountFailover('auth-empty', 'sk_mount_auth_empty', 'single', { status: 401, message: 'HTTP 401', raw: '' })
+  await verifyAccountFailover('auth-html', 'sk_mount_auth_html', 'single', { status: 403, message: 'Access denied', raw: '<html>Access denied</html>' })
+
+  // A locally unconfigured account must be skipped before opening a request.
+  await panelPost(envelope('account.add', { name: 'missing-key', apiKeyEnv: 'MOUNT_MISSING_KEY' }), cookie)
+  for (const account of await readAccounts()) {
+    await panelPost(envelope('account.enable', { name: account.key, enabled: ['missing-key', 'backup'].includes(account.key) }), cookie)
+  }
+  await panelPost(envelope('account.mode', { mode: 'single', active: 'missing-key' }), cookie)
+  const beforeMissing = servedAccounts.length
+  const missingChunks = []
+  for await (const chunk of llm.stream({ provider: 'cline-pass', model: 'cline-pass/glm-5.2', messages: [userMessage('missing credential')] })) missingChunks.push(chunk)
+  check('missing credentials do not block a valid backup through the installed runtime', missingChunks.at(-1)?.reason?.kind === 'stop')
+  check('only the configured backup reaches the gateway', JSON.stringify(servedAccounts.slice(beforeMissing)) === JSON.stringify([backupKey]))
+  check('quota peeks skip accounts without a credential too', await readEffective() === 'backup')
+
+  // update merges objects, so replacing the pool needs explicit deletion.
+  const accountTool = tools.get('cline_pass_accounts')
+  const afterSet = await accountTool.execute({ action: 'set', accounts: [{ name: 'backup' }] }, { signal: new AbortController().signal })
+  check('full replacement removes omitted accounts in real settings', JSON.stringify(afterSet.accounts.map((a) => a.key)) === JSON.stringify(['backup']))
+  check('replacement clears an omitted active account', afterSet.activeAccount === '')
+  const replacementDocuments = [join(scratch, 'settings.yaml'), join(profileDir, 'cordis.patch.yml')].filter(existsSync).map((path) => readFileSync(path, 'utf8'))
+  check('replacement removes the old account from the persisted document', !replacementDocuments.some((text) => text.includes('missing-key')))
+  await accountTool.execute({ action: 'set', accounts: [] }, { signal: new AbortController().signal })
+  const emptyState = (await panelPost(envelope('state'), cookie)).json?.value
+  check('empty replacement removes all explicit accounts in real settings', emptyState.accounts.length === 1 && emptyState.accounts[0].key === 'default' && emptyState.accounts[0].declared === false)
 } catch (error) {
   failures.push(`unexpected failure — ${error?.stack ?? error}`)
 } finally {

@@ -16,8 +16,9 @@
 
 import { createServer } from 'node:http'
 import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
+import { createAssistantMessage, createDeveloperMessage, createToolResultMessage } from '@deepseek-ai/dsh-llm'
 import { ClinePassAdapter, Config, DEFAULT_REQUEST_IMAGE_POLICY, apply, inject, name } from '../lib/index.js'
-import { buildRequestBody, createUpstreamSlots, prepareRequestImages, projectImageDimensions, reasoningOf, requestImageTarget } from '../lib/adapter.js'
+import { buildRequestBody, createUpstreamSlots, DEFAULT_MAX_TOKENS, prepareRequestImages, projectImageDimensions, reasoningOf, requestImageTarget } from '../lib/adapter.js'
 import { createEngine } from '../lib/engine.js'
 import { createPanel, PANEL_ERROR_CODE, PANEL_PATH, registerPanel } from '../lib/panel.js'
 import {
@@ -909,6 +910,16 @@ try {
     settingsAvailable: () => true,
     routeRegistered: () => true,
     readConfig: () => section,
+    // The account a request would use, mirroring the host: a pool resolves to its
+    // first enabled account and single mode honours `activeAccount`. The stub has
+    // no round-robin cursor, so it cannot model a cursor that has advanced.
+    effectiveAccount: () => {
+      const enabled = accountProfilesOf(section).filter((account) => account.enabled)
+      const chosen = section.accountMode === 'roundrobin'
+        ? enabled[0]
+        : enabled.find((account) => String(account.key) === String(section.activeAccount ?? '')) ?? enabled[0]
+      return chosen === undefined ? '' : String(chosen.key)
+    },
     updateConfig: async (patch) => { section = { ...section, ...patch } },
     accounts: () => accountProfilesOf(section),
     accountsWithKeys: async () => await Promise.all(accountProfilesOf(section).map(async (account) => {
@@ -1193,7 +1204,14 @@ try {
   // ── model metadata on the seam ────────────────────────────────────────────
   const resolved = await plain.adapter.resolveModel('cline-pass', 'cline-pass/deepseek-v4.1-flash')
   check('published context window is advertised, not the route default', resolved.context.contextWindow === 1000000, String(resolved.context.contextWindow))
-  check('published output cap is advertised', resolved.defaultMaxTokens === 384000, String(resolved.defaultMaxTokens))
+  // A budget, not the model's ceiling: the harness fills `max_tokens` from this and
+  // reserves the same number as completion room, so advertising the published 384k
+  // would compact a 1M window at 55% instead of the 80% the threshold ratio asks for.
+  // The configured budget here is the 32000 this harness sets, below the ceiling.
+  check('the published output ceiling bounds the budget instead of becoming it',
+    resolved.defaultMaxTokens === 32000
+      && resolved.defaultMaxTokens < MODEL_CATALOG['cline-pass/deepseek-v4.1-flash'].maxTokens,
+    String(resolved.defaultMaxTokens))
   check('the model name is its display name', resolved.name === 'DeepSeek V4.1 Flash', resolved.name)
   check('reasoning capability is advertised', resolved.reasoning !== undefined && resolved.reasoning.efforts.length > 0)
   const effortIds = resolved.reasoning.efforts.map((effort) => effort.id)
@@ -1250,6 +1268,44 @@ try {
     if (!expectedEfforts && entry.reasoning !== undefined) catalogProblems.push(`${id}: unexpected efforts`)
   }
   check(`all ${Object.keys(MODEL_CATALOG).length} catalog entries resolve to valid seam metadata`, catalogProblems.length === 0, catalogProblems.join(', '))
+
+  // ── the output budget, as distinct from the model's output ceiling ─────────
+  //
+  // dsh fills a request's `max_tokens` from `defaultMaxTokens` and reserves the same
+  // number as completion room before it compacts, on top of a fixed headroom. The
+  // published figure is the model's OUTPUT CEILING, so advertising it as the budget
+  // reserved that much of every window: a 384k ceiling moved compaction on a 1M
+  // window from 80% down to 55%, and the two kimi entries — whose published ceiling
+  // equals their window — left the policy no message budget at all, which it answers
+  // with an error rather than a reading.
+  const COMPACTION_HEADROOM = 65536
+  const COMPACTION_RATIO = 0.8
+  {
+    const ceiling = MODEL_CATALOG['cline-pass/deepseek-v4.1-flash'].maxTokens
+    const above = resolveModelMetadata('cline-pass', 'cline-pass/deepseek-v4.1-flash', emptyOverride, { ...fallback, maxTokens: 900000 })
+    check('a ceiling below the configured budget clamps it', above.defaultMaxTokens === ceiling, String(above.defaultMaxTokens))
+    const below = resolveModelMetadata('cline-pass', 'cline-pass/deepseek-v4.1-flash', emptyOverride, { ...fallback, maxTokens: 8000 })
+    check('a ceiling above the configured budget leaves it alone', below.defaultMaxTokens === 8000, String(below.defaultMaxTokens))
+    // kimi-k2.6 publishes a ceiling equal to its whole window; a hand-set budget past
+    // half of it is pulled back so the reserve always leaves room to compact into.
+    const guarded = resolveModelMetadata('cline-pass', 'cline-pass/kimi-k2.6', emptyOverride, { ...fallback, maxTokens: 900000 })
+    check('a budget hand-set past half the window is pulled back to it',
+      guarded.defaultMaxTokens === Math.floor(MODEL_CATALOG['cline-pass/kimi-k2.6'].contextWindow / 2), String(guarded.defaultMaxTokens))
+
+    const ratios = Object.keys(MODEL_CATALOG).map((id) => {
+      const entry = resolveModelMetadata('cline-pass', id, emptyOverride, { ...fallback, maxTokens: DEFAULT_MAX_TOKENS })
+      const window = entry.context.contextWindow
+      const pressure = window - entry.defaultMaxTokens - COMPACTION_HEADROOM
+      return { id, ratio: pressure <= 0 ? 0 : Math.min(window * COMPACTION_RATIO, pressure) / window }
+    })
+    check('no catalog model leaves the compaction policy without a message budget',
+      ratios.every(({ ratio }) => ratio > 0),
+      ratios.filter(({ ratio }) => ratio <= 0).map(({ id }) => id).join(', '))
+    // The two that used to throw both sit exactly on the half-window bound.
+    check('the models whose ceiling equals their window still compact late enough',
+      ratios.filter(({ id }) => id.includes('kimi-k2.')).every(({ ratio }) => ratio >= 0.25),
+      JSON.stringify(ratios.filter(({ id }) => id.includes('kimi-k2.')).map(({ id, ratio }) => [id, Number(ratio.toFixed(3))])))
+  }
   check('the effort list matches the gateway vocabulary exactly', REASONING_EFFORTS.map((effort) => effort.id).join(',') === 'none,minimal,low,medium,high,xhigh,max', REASONING_EFFORTS.map((effort) => effort.id).join(','))
   check('an explicit per-model effort override hides the picker', resolveModelMetadata('cline-pass', 'cline-pass/deepseek-v4.1-flash', { reasoning: false }, fallback).reasoning === undefined)
 
@@ -1273,7 +1329,8 @@ try {
     check('published modalities reach a new model', resolved.inputModalities.join('+') === 'text+image', JSON.stringify(resolved.inputModalities))
     check('published modalities are clamped to the seam vocabulary', resolved.inputModalities.every((m) => m === 'text' || m === 'image'), JSON.stringify(resolved.inputModalities))
     check('the published context window reaches a new model', resolved.context.contextWindow === published.contextWindow, String(resolved.context.contextWindow))
-    check('the published output cap reaches a new model', resolved.defaultMaxTokens === published.maxTokens, String(resolved.defaultMaxTokens))
+    check('a published output ceiling bounds a new model budget too',
+      resolved.defaultMaxTokens === Math.min(fallback.maxTokens, published.maxTokens), String(resolved.defaultMaxTokens))
     check('the published display name reaches a new model', resolved.name === published.name, resolved.name)
 
     // The shipped table is curated, so it stays the reference for what it knows:
@@ -1509,6 +1566,101 @@ try {
   check('tool message is emitted', toolIndex !== -1, JSON.stringify(toolWire))
   check('tool-result image rides a following user message', imgUserIndex > toolIndex, `tool=${toolIndex} imgUser=${imgUserIndex}`)
   check('tool-result image has data URI url', toolWire[imgUserIndex]?.content?.some(p => p.type === 'image_url' && p.image_url?.url?.startsWith('data:image/png;base64,')), JSON.stringify(toolWire[imgUserIndex]))
+
+  // ── tool-role messages: the shape dsh >= 0.2.0 sends ──────────────────────
+  // A harness tool result is now a `tool`-role message whose call identity sits
+  // on the message, not a user message wrapping a `tool-result` block. The wire
+  // request is invalid whenever an assistant message carrying tool calls is not
+  // followed by the answer to every call in it.
+  const toolRoleMessages = [
+    { role: 'user', content: [{ type: 'text', text: 'run both' }] },
+    { role: 'assistant', content: [
+      { type: 'tool-call', id: 'call-a', name: 'bash', arguments: '{"command":"pwd"}' },
+      { type: 'tool-call', id: 'call-b', name: 'read', arguments: '{"file_path":"x"}' },
+    ] },
+    { role: 'tool', toolCallId: 'call-a', content: [{ type: 'text', text: 'a out' }] },
+    { role: 'tool', toolCallId: 'call-b', content: [{ type: 'text', text: 'b out' }] },
+  ]
+  const toolRoleWire = buildRequestBody({ model: 'cline-pass/deepseek-v4.1-flash', messages: toolRoleMessages }, {}).messages
+  check('tool-role results are emitted as tool messages', toolRoleWire.length === 4 && toolRoleWire.slice(2).every(m => m.role === 'tool'), JSON.stringify(toolRoleWire))
+  check('a parallel group is answered before the next user turn', toolRoleWire[2]?.role === 'tool' && toolRoleWire[3]?.role === 'tool', JSON.stringify(toolRoleWire))
+  check('tool messages answer their call id', toolRoleWire[2]?.tool_call_id === 'call-a' && toolRoleWire[3]?.tool_call_id === 'call-b', JSON.stringify(toolRoleWire))
+  check('tool message content is the flattened result text', toolRoleWire[2]?.content === 'a out', JSON.stringify(toolRoleWire[2]))
+
+  const emptyToolWire = buildRequestBody({ model: 'cline-pass/deepseek-v4.1-flash', messages: [
+    { role: 'assistant', content: [{ type: 'tool-call', id: 'call-e', name: 'bash', arguments: '{}' }] },
+    { role: 'tool', toolCallId: 'call-e', content: [] },
+  ] }, {}).messages
+  check('a tool result with no text still answers its call', emptyToolWire[1]?.role === 'tool' && emptyToolWire[1]?.content === '(no output)', JSON.stringify(emptyToolWire))
+
+  const toolRoleImageMessages = [
+    { role: 'assistant', content: [{ type: 'tool-call', id: 'call-img', name: 'read_image', arguments: '{}' }] },
+    { role: 'tool', toolCallId: 'call-img', content: [{ type: 'text', text: 'shot' }, { type: 'image', attachment: dummyRef }] },
+  ]
+  const toolRoleImagePrepared = await prepareRequestImages(toolRoleImageMessages, mockAttachments, DEFAULT_REQUEST_IMAGE_POLICY)
+  const toolRoleImageWire = buildRequestBody({ model: 'cline-pass/deepseek-v4.1-flash', messages: toolRoleImageMessages }, {}, toolRoleImagePrepared).messages
+  check('a tool-role tool message is emitted', toolRoleImageWire[1]?.role === 'tool' && toolRoleImageWire[1]?.tool_call_id === 'call-img', JSON.stringify(toolRoleImageWire))
+  check('an image inside a tool-role result rides a following user message', toolRoleImageWire[2]?.role === 'user' && Array.isArray(toolRoleImageWire[2]?.content) && toolRoleImageWire[2].content.some(p => p.type === 'image_url'), JSON.stringify(toolRoleImageWire))
+
+  // ── the group guard: nothing may split a tool-call run ────────────────────
+  //
+  // The wire rule is that an assistant message carrying `tool_calls` is followed
+  // immediately by one `tool` message per id. A gateway that validates it rejects
+  // the whole request — "insufficient tool messages following tool_calls message"
+  // — so a message that would land inside the run has to wait for it to close.
+  // These use the host's own factories rather than hand-written literals: the
+  // previous shape bug survived because the tests spelled the shape themselves.
+  const guarded = (extra) => buildRequestBody({ model: 'cline-pass/deepseek-v4.1-flash', messages: [
+    { role: 'user', content: [{ type: 'text', text: 'run both' }] },
+    createAssistantMessage({ content: [
+      { type: 'tool-call', id: 'g-a', name: 'bash', arguments: '{}' },
+      { type: 'tool-call', id: 'g-b', name: 'bash', arguments: '{}' },
+    ] }),
+    ...extra,
+  ] }, {}).messages
+
+  const noticeBetween = guarded([
+    createDeveloperMessage({ content: [{ type: 'text', text: 'tool registry changed' }] }),
+    createToolResultMessage({ callId: 'g-a', content: [{ type: 'text', text: 'a' }], isError: false }),
+    createToolResultMessage({ callId: 'g-b', content: [{ type: 'text', text: 'b' }], isError: false }),
+  ])
+  check('a notice between an assistant tool_calls and its answers does not split the group',
+    noticeBetween[1]?.role === 'assistant' && noticeBetween[2]?.role === 'tool' && noticeBetween[3]?.role === 'tool',
+    JSON.stringify(noticeBetween.map((m) => m.role)))
+  check('the held notice is emitted once the group closes, in order',
+    noticeBetween[4]?.role === 'system' && noticeBetween[4]?.content === 'tool registry changed',
+    JSON.stringify(noticeBetween[4]))
+
+  // A `developer` notice is the harness's own system-level guidance; it must not
+  // arrive as something the user is supposed to have said.
+  const developerRoles = guarded([createDeveloperMessage({ content: [{ type: 'text', text: 'be terse' }] })])
+  check('a developer message is sent as a system message',
+    developerRoles[1]?.role === 'assistant' && developerRoles[2]?.role === 'system' && developerRoles[2]?.content === 'be terse',
+    JSON.stringify(developerRoles.map((m) => m.role)))
+
+  // The legacy shape wrapped a result in a user message that could carry text
+  // too; emitting that text first put a user turn inside the group.
+  const legacyBetween = buildRequestBody({ model: 'cline-pass/deepseek-v4.1-flash', messages: [
+    createAssistantMessage({ content: [{ type: 'tool-call', id: 'g-c', name: 'bash', arguments: '{}' }] }),
+    { role: 'user', content: [
+      { type: 'text', text: 'here is the result' },
+      { type: 'tool-result', toolCallId: 'g-c', content: [{ type: 'text', text: 'c out' }] },
+    ] },
+  ] }, {}).messages
+  check('a legacy user message carrying a result does not split the group either',
+    legacyBetween[1]?.role === 'tool' && legacyBetween[1]?.tool_call_id === 'g-c' && legacyBetween[2]?.role === 'user',
+    JSON.stringify(legacyBetween.map((m) => `${m.role}${m.tool_call_id ? '(' + m.tool_call_id + ')' : ''}`)))
+
+  // A conversation with no tool calls must serialize exactly as before: the guard
+  // is a no-op when no group is open.
+  const plainWire = buildRequestBody({ model: 'cline-pass/deepseek-v4.1-flash', messages: [
+    { role: 'user', content: [{ type: 'text', text: 'one' }] },
+    { role: 'assistant', content: [{ type: 'text', text: 'two' }] },
+    { role: 'user', content: [{ type: 'text', text: 'three' }] },
+  ] }, {}).messages
+  check('a conversation with no tool calls is untouched by the guard',
+    JSON.stringify(plainWire.map((m) => m.role)) === JSON.stringify(['user', 'assistant', 'user']),
+    JSON.stringify(plainWire.map((m) => m.role)))
 } catch (error) {
   failures.push(`unexpected failure — ${error?.stack ?? error}`)
 }
