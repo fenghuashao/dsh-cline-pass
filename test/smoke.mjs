@@ -16,7 +16,14 @@
 
 import { createServer } from 'node:http'
 import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
-import { createAssistantMessage, createDeveloperMessage, createToolResultMessage } from '@deepseek-ai/dsh-llm'
+import * as dshLlm from '@deepseek-ai/dsh-llm'
+// The stable dsh line (0.1.5-rc.3) has no createDeveloperMessage; 0.1.7-alpha.2
+// adds it as exactly this wrapper over the generic createMessage, which both
+// lines export. Fork-local so the suite runs on either host line.
+const createAssistantMessage = dshLlm.createAssistantMessage
+const createToolResultMessage = dshLlm.createToolResultMessage
+const createDeveloperMessage = dshLlm.createDeveloperMessage
+  ?? ((input) => dshLlm.createMessage({ ...input, role: 'developer' }))
 import { ClinePassAdapter, Config, DEFAULT_REQUEST_IMAGE_POLICY, apply, inject, name } from '../lib/index.js'
 import { buildRequestBody, createUpstreamSlots, DEFAULT_MAX_TOKENS, prepareRequestImages, projectImageDimensions, reasoningOf, requestImageTarget } from '../lib/adapter.js'
 import { createEngine } from '../lib/engine.js'
