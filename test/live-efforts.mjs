@@ -1,18 +1,19 @@
 /**
- * Live check that the gateway accepts every effort the plugin advertises.
+ * Live check that the gateway accepts every level this model advertises.
  *
  * The plugin's whole point is that the picker's options are the gateway's
- * options; an offered value the gateway rejects with HTTP 400 is worse than
- * offering nothing. This asks the real gateway for each effort in
- * REASONING_EFFORTS and reports the HTTP status plus reasoning-token count,
- * which also shows the levels actually differ in behaviour.
+ * options; an offered value the gateway rejects is worse than offering nothing.
+ * The levels are per model now — the upstream publishes them — so this walks the
+ * list the plugin resolves for one model, not the whole vocabulary, and reports
+ * the HTTP status plus reasoning-token count, which also shows the levels actually
+ * differ in behaviour.
  *
- * Costs one tiny request per effort. Run with: node test/live-efforts.mjs
+ * Costs one tiny request per level. Run with: node test/live-efforts.mjs
  */
 
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { REASONING_EFFORTS } from '../lib/catalog.js'
+import { resolveModelMetadata } from '../lib/catalog.js'
 
 const MODEL = 'cline-pass/deepseek-v4.1-flash'
 const BASE = 'https://api.cline.bot/api/v1'
@@ -75,9 +76,17 @@ const key = apiKey()
 console.log(`live effort check — ${MODEL} (key ${key.slice(0, 5)}…${key.slice(-4)})\n`)
 
 let failures = 0
+// What the picker would offer for this model, which is the list under test.
+const advertised = resolveModelMetadata(
+  'cline-pass',
+  MODEL,
+  { name: '', contextWindow: 0, maxTokens: 0, input: [], reasoning: undefined },
+  { contextWindow: 128000, maxTokens: 64000, reasoning: true },
+).reasoning.efforts.map((entry) => entry.id)
+console.log(`  advertising: ${advertised.join(', ')}\n`)
 // The omitted case must also be exercised: it proves the plugin's "no default"
 // behaviour leaves the request valid instead of sending an empty field.
-for (const effort of [undefined, ...REASONING_EFFORTS.map((entry) => entry.id)]) {
+for (const effort of [undefined, ...advertised]) {
   const label = effort === undefined ? '(omitted)' : effort
   try {
     const result = await ask(key, effort)

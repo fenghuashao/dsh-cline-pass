@@ -247,7 +247,10 @@ try {
   check('the vision model advertises image input on the real seam', Array.isArray(resolvedFlash.inputModalities) && resolvedFlash.inputModalities.includes('image'), JSON.stringify(resolvedFlash.inputModalities))
   const resolvedTextOnly = await llm.resolveModelInfo('cline-pass', 'cline-pass/deepseek-v4-pro')
   check('a text-only model does not advertise image input', Array.isArray(resolvedTextOnly.inputModalities) && !resolvedTextOnly.inputModalities.includes('image'), JSON.stringify(resolvedTextOnly.inputModalities))
-  check('the real seam accepts the reasoning efforts', resolvedFlash.reasoning?.efforts.length === 7 && !resolvedFlash.reasoning.efforts.some((effort) => effort.id === 'off'), JSON.stringify(resolvedFlash.reasoning))
+  check('the real seam accepts the reasoning levels this model publishes',
+    resolvedFlash.reasoning?.efforts.map((effort) => effort.id).join(',') === 'none,low,high,max'
+      && !resolvedFlash.reasoning.efforts.some((effort) => effort.id === 'off'),
+    JSON.stringify(resolvedFlash.reasoning))
 
   // ── the tools ─────────────────────────────────────────────────────────────
   const tools = ctx.get('tools')

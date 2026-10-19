@@ -1215,7 +1215,12 @@ try {
   check('the model name is its display name', resolved.name === 'DeepSeek V4.1 Flash', resolved.name)
   check('reasoning capability is advertised', resolved.reasoning !== undefined && resolved.reasoning.efforts.length > 0)
   const effortIds = resolved.reasoning.efforts.map((effort) => effort.id)
-  check('every gateway-accepted effort is offered', ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].every((id) => effortIds.includes(id)), effortIds.join(','))
+  // The levels are a per-model fact, published by the upstream gateway. A model
+  // that answers to four of them used to advertise all seven and the picker showed
+  // every one, so tightening this also pins the narrowing.
+  check('only the levels this model publishes are offered', effortIds.join(',') === 'none,low,high,max', effortIds.join(','))
+  check('every offered level belongs to the gateway vocabulary',
+    effortIds.every((id) => REASONING_EFFORTS.some((effort) => effort.id === id)), effortIds.join(','))
   check('"off" is never offered — the gateway rejects it with HTTP 400', !effortIds.includes('off'), effortIds.join(','))
   check('no effort is forced when the caller omits one', resolved.reasoning.defaultEffort === undefined, String(resolved.reasoning.defaultEffort))
   const unknown = await plain.adapter.resolveModel('cline-pass', 'cline-pass/not-in-catalog')
@@ -1263,9 +1268,16 @@ try {
     // reports audio for mimo-v2.5) must be clamped, not passed through.
     if (!entry.inputModalities.every((modality) => modality === 'text' || modality === 'image')) catalogProblems.push(`${id}: modality ${entry.inputModalities.join('+')}`)
     if (entry.inputModalities.length === 0) catalogProblems.push(`${id}: no modality`)
+    // Each entry offers the levels it was published with. An entry with no
+    // published list — a model whose upstream names only a toggle or a token
+    // budget — keeps the whole vocabulary instead of being narrowed to nothing.
+    const declared = MODEL_CATALOG[id].efforts
     const expectedEfforts = MODEL_CATALOG[id].reasoning === true
-    if (expectedEfforts && entry.reasoning?.efforts.length !== 7) catalogProblems.push(`${id}: efforts`)
-    if (!expectedEfforts && entry.reasoning !== undefined) catalogProblems.push(`${id}: unexpected efforts`)
+      ? (Array.isArray(declared) ? declared : REASONING_EFFORTS.map((effort) => effort.id))
+      : []
+    const offered = entry.reasoning?.efforts.map((effort) => effort.id) ?? []
+    if (expectedEfforts.length === 0 && entry.reasoning !== undefined) catalogProblems.push(`${id}: unexpected efforts`)
+    if (expectedEfforts.length > 0 && offered.join(',') !== expectedEfforts.join(',')) catalogProblems.push(`${id}: efforts ${offered.join('+')}`)
   }
   check(`all ${Object.keys(MODEL_CATALOG).length} catalog entries resolve to valid seam metadata`, catalogProblems.length === 0, catalogProblems.join(', '))
 
@@ -1369,6 +1381,81 @@ try {
     check('an id-only source still contributes membership', scan.models.includes('cline-pass/brand-new'), scan.models.join(','))
     check('an id-only model carries no invented metadata', scan.catalog['cline-pass/brand-new'] === undefined, JSON.stringify(scan.catalog['cline-pass/brand-new']))
     check('the scan still reports its sources', scan.sources.join(',') === 'cline.api,models.dev', scan.sources.join(','))
+  }
+
+  // ── the reasoning levels come from the upstream, not from a global list ────
+  //
+  // Cline Pass publishes no levels: its `/models` carries ids only, and its gateway
+  // accepts every level in the vocabulary for every model, so an unsupported one
+  // cannot even be probed out. The upstream it routes through does publish them, and
+  // only that field is taken from there — its output cap disagrees with the shipped
+  // one, and adopting that too would resize every request's completion reserve.
+  {
+    const upstream = {
+      data: [
+        { id: 'deepseek/deepseek-v4.1-flash', max_tokens: 32768, context_window: 1048576, reasoning_options: [{ type: 'toggle' }, { type: 'effort', values: ['none', 'low', 'high', 'max'] }] },
+        // Published after this release, so the shipped table does not describe it.
+        { id: 'deepseek/deepseek-v4.1-flash-1017', name: 'DeepSeek V4.1 Flash 1017', modalities: { input: ['text', 'image', 'audio', 'video'], output: ['text'] }, max_tokens: 1048576, context_window: 1048576, reasoning_options: [{ type: 'toggle' }, { type: 'effort', values: ['none', 'low', 'high', 'max'] }] },
+        { id: 'zai/glm-5.3', reasoning_options: [{ type: 'effort', values: ['low', 'high', 'max'] }] },
+        { id: 'moonshotai/kimi-k2.6', reasoning_options: [{ type: 'toggle' }] },
+        { id: 'minimax/minimax-m3', reasoning_options: [{ type: 'budget_tokens' }] },
+      ],
+    }
+    const scan = await fetchOfficialModels({
+      fetchImpl: async (url) => ({
+        ok: true,
+        async json() {
+          const target = String(url)
+          if (target.includes('models.dev')) return {}
+          if (target.includes('vercel')) return upstream
+          return { clinePass: ['cline-pass/deepseek-v4.1-flash', { id: 'cline-pass/deepseek-v4.1-flash-1017', name: 'cline-pass/deepseek-v4.1-flash-1017' }, 'cline-pass/glm-5.3', 'cline-pass/kimi-k2.6', 'cline-pass/minimax-m3'] }
+        },
+      }),
+    })
+    const levels = (id) => (scan.catalog?.[id]?.efforts ?? []).join(',')
+    check('the scan keeps the levels the upstream publishes',
+      levels('cline-pass/deepseek-v4.1-flash') === 'none,low,high,max', levels('cline-pass/deepseek-v4.1-flash'))
+    check('the levels are matched through the id tail',
+      levels('cline-pass/glm-5.3') === 'low,high,max', levels('cline-pass/glm-5.3'))
+    // A toggle, or a token budget, names no levels — those keep the whole vocabulary
+    // rather than being narrowed to a single `none`.
+    check('a toggle-only model contributes no level list',
+      scan.catalog?.['cline-pass/kimi-k2.6']?.efforts === undefined, JSON.stringify(scan.catalog?.['cline-pass/kimi-k2.6']))
+    check('a budget-only model contributes no level list',
+      scan.catalog?.['cline-pass/minimax-m3']?.efforts === undefined, JSON.stringify(scan.catalog?.['cline-pass/minimax-m3']))
+    check('the upstream catalogue contributes a window and levels, not an output cap',
+      scan.catalog?.['cline-pass/deepseek-v4.1-flash']?.contextWindow === 1048576
+        && scan.catalog?.['cline-pass/deepseek-v4.1-flash']?.maxTokens === undefined,
+      JSON.stringify(scan.catalog?.['cline-pass/deepseek-v4.1-flash']))
+    // A model published after this release has no shipped entry. Without the window
+    // from the upstream it resolved through the route's conservative 128k fallback,
+    // so the picker showed an eighth of the window the model actually has.
+    const listed = (id) => resolveModelMetadata('cline-pass', id, { ...emptyOverride }, fallback, scan.catalog?.[id] ?? {})
+    check('the model is not in the shipped table', MODEL_CATALOG['cline-pass/deepseek-v4.1-flash-1017'] === undefined)
+    check('a model newer than the release gets its real window, not the route fallback',
+      listed('cline-pass/deepseek-v4.1-flash-1017').context.contextWindow === 1048576,
+      String(listed('cline-pass/deepseek-v4.1-flash-1017').context.contextWindow))
+    check('that newer model carries its published levels too',
+      listed('cline-pass/deepseek-v4.1-flash-1017').reasoning.efforts.map((effort) => effort.id).join(',') === 'none,low,high,max',
+      JSON.stringify(listed('cline-pass/deepseek-v4.1-flash-1017').reasoning))
+    // Everything else the upstream knows about a model this release never shipped:
+    // without the modalities the harness refuses its images with no explanation, and
+    // without the label the picker shows the raw id.
+    check('a newer model keeps the modalities the upstream publishes',
+      listed('cline-pass/deepseek-v4.1-flash-1017').inputModalities.join('+') === 'text+image',
+      JSON.stringify(listed('cline-pass/deepseek-v4.1-flash-1017').inputModalities))
+    check('the upstream modalities are clamped to the seam vocabulary',
+      listed('cline-pass/deepseek-v4.1-flash-1017').inputModalities.every((modality) => modality === 'text' || modality === 'image'),
+      JSON.stringify(listed('cline-pass/deepseek-v4.1-flash-1017').inputModalities))
+    check('a newer model takes the label the upstream publishes, not its id',
+      listed('cline-pass/deepseek-v4.1-flash-1017').name === 'DeepSeek V4.1 Flash 1017',
+      listed('cline-pass/deepseek-v4.1-flash-1017').name)
+    // The shipped table still wins for a model it describes: the upstream's figure for
+    // this one is 1048576, and the released table says 1000000.
+    check('the shipped table still wins over the upstream for a model it describes',
+      resolveModelMetadata('cline-pass', 'cline-pass/deepseek-v4.1-flash', { ...emptyOverride }, fallback, scan.catalog?.['cline-pass/deepseek-v4.1-flash'] ?? {}).context.contextWindow === 1000000,
+      String(resolveModelMetadata('cline-pass', 'cline-pass/deepseek-v4.1-flash', { ...emptyOverride }, fallback, scan.catalog?.['cline-pass/deepseek-v4.1-flash'] ?? {}).context.contextWindow))
+    check('the scan reports the upstream source', scan.sources.includes('vercel'), scan.sources.join(','))
   }
 
   // ── reasoning effort reaches the wire ─────────────────────────────────────
